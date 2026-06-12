@@ -1,0 +1,15 @@
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\adler32.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\adler32.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\compress.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\compress.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\crc32.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\crc32.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\deflate.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\deflate.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\gzclose.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\gzclose.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\gzlib.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\gzlib.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\gzread.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\gzread.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\gzwrite.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\gzwrite.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\infback.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\infback.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\inffast.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\inffast.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\inflate.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\inflate.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\inftrees.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\inftrees.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\trees.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\trees.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\uncompr.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\uncompr.obj
+C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\src\zutil.c;C:\Users\Administrator\source\repos\mm_converter\Dependencies\zlib\bin-int\x64-Release\zutil.obj
