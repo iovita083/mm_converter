@@ -212,3 +212,4 @@ healthchecksdb
 
 # Backup folder for Package Reference Convert tool in Visual Studio 2017
 MigrationBackup/
+/Dependencies/zlib/bin-int/x64-Release
