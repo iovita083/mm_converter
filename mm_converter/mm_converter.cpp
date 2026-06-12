@@ -154,14 +154,20 @@ struct FarcArchive {
                 if (!e.compressed) {
                     return std::vector<uint8_t>(src, src + e.size);
                 }
-                // gzip decompress
+                // gzip decompress (windowBits=47 = 15+32, handles gzip and zlib)
                 std::vector<uint8_t> out(e.uncompressed);
-                uLongf dest_len = e.uncompressed;
-                if (uncompress(out.data(), &dest_len, src, e.size) != Z_OK) {
+                z_stream zs{};
+                zs.next_in  = const_cast<Bytef*>(src);
+                zs.avail_in = e.size;
+                zs.next_out = out.data();
+                zs.avail_out = e.uncompressed;
+                if (inflateInit2(&zs, 47) != Z_OK || inflate(&zs, Z_FINISH) < Z_OK) {
+                    inflateEnd(&zs);
                     fprintf(stderr, "Failed to decompress %s\n", name.c_str());
                     return {};
                 }
-                out.resize(dest_len);
+                inflateEnd(&zs);
+                out.resize(zs.total_out);
                 return out;
             }
         }
