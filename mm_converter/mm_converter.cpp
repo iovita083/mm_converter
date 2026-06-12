@@ -17,6 +17,7 @@
 #include <fstream>
 #include <sstream>
 #include <functional>
+#include <iomanip>
 #include <zlib.h>
 
 namespace fs = std::filesystem;
@@ -39,6 +40,20 @@ static std::string trim(const std::string& s) {
     size_t e = s.find_last_not_of(" \t\r\n");
     if (b == std::string::npos) return "";
     return s.substr(b, e - b + 1);
+}
+
+// Strip anything after the first whitespace (removes inline comments like "(FORMAT IS ...)")
+static std::string sanitize_token(const std::string& s) {
+    size_t sp = s.find_first_of(" \t");
+    return sp == std::string::npos ? s : s.substr(0, sp);
+}
+
+// Truncate float to 2 decimal places (no rounding)
+static std::string fmt_time(float v) {
+    int trunc = (int)(v * 100.0f);
+    std::ostringstream os;
+    os << (trunc / 100) << "." << std::setw(2) << std::setfill('0') << (trunc % 100);
+    return os.str();
 }
 
 static void run(const std::string& cmd) {
@@ -183,11 +198,6 @@ struct FarcArchive {
 };
 
 // ---- Sprite Set Binary (.bin) -----------------------------------------------
-// DT format (little-endian section-based):
-//   Section header: 4-char sig | u32 sectionSize | u32 dataOffset (rel to base) |
-//                   u32 endianFlag | u32 depth | u32 dataSize | ... sub-sections
-// SPRC section contains sprite data; MTXD contains texture data.
-
 struct SpriteInfo {
     std::string name;
     uint32_t texture_index;
@@ -206,211 +216,129 @@ struct SpriteSetBin {
     std::vector<TextureInfo> textures;
 };
 
-// Section header (little-endian after the 4-char sig)
-struct SecHdr {
-    uint32_t section_size;
-    uint32_t data_offset_rel; // relative to base (start of sig)
-    uint32_t endian_flag;
-    uint32_t depth;
-    uint32_t data_size;
-};
+// (section-format structs removed; Mega Mix+ bins are flat format)
 
-static bool parse_section_header(const uint8_t* base, size_t total, size_t pos,
-    const char* expected_sig, SecHdr& out_hdr, size_t& out_data_start)
-{
-    if (pos + 24 > total) return false;
-    if (expected_sig && memcmp(base + pos, expected_sig, 4) != 0) return false;
-    out_hdr.section_size = read_u32le(base + pos + 4);
-    out_hdr.data_offset_rel = read_u32le(base + pos + 8);
-    out_hdr.endian_flag = read_u32le(base + pos + 12);
-    out_hdr.depth = read_u32le(base + pos + 16);
-    out_hdr.data_size = read_u32le(base + pos + 20);
-    // data starts at pos + data_offset_rel (data_offset_rel is from section start)
-    out_data_start = pos + out_hdr.data_offset_rel;
-    return true;
-}
 
-// Parse TXP texture (MikuMikuLibrary Texture format)
-static bool parse_texture(const uint8_t* p, size_t sz, TextureInfo& out) {
-    if (sz < 16) return false;
-    // TXP4 or TXP5 signature
-    uint32_t sig = read_u32le(p);
+// Flat-format .bin layout (Mega Mix+):
+//   [0]  u32 signature (ignored)
+//   [4]  u32 texturesOffset    -- offset to TXP3 TextureSet, relative to file start
+//   [8]  i32 textureCount
+//   [12] i32 spriteCount
+//   [16] u32 spritesOffset     -- relative to file start
+//   [20] u32 texNamesOffset    -- relative to file start, array of u32 string offsets
+//   [24] u32 sprNamesOffset    -- relative to file start, array of u32 string offsets
+//   [28] u32 sprModesOffset    -- relative to file start (unused here)
+//
+// TXP3 TextureSet at texturesOffset:
+//   [0] u32 0x03505854, [4] u32 count, [8] u32 countInfo
+//   [12] count x u32 offsets -> TXP4, each relative to TXP3 block start
+//
+// TXP4 Texture at (txp3_base + offset):
+//   [0] u32 0x04505854, [4] u32 subCount, [8] u32 info (mips|array<<8)
+//   [12] subCount x u32 offsets -> TXP2, each relative to TXP4 block start
+//
+// TXP2 SubTexture at (txp4_base + offset):
+//   [0] u32 0x02505854, [4] u32 width, [8] u32 height, [12] u32 format,
+//   [16] u32 id, [20] u32 dataSize, [24..] pixel data
+
+static bool parse_texture(const uint8_t* txp4, size_t avail, TextureInfo& out) {
+    if (avail < 16) return false;
+    uint32_t sig = read_u32le(txp4);
     if (sig != 0x04505854 && sig != 0x05505854) return false;
-    int sub_count = (int)read_u32le(p + 4);
-    uint32_t info = read_u32le(p + 8);
+    int sub_count = (int)read_u32le(txp4 + 4);
+    uint32_t info = read_u32le(txp4 + 8);
     int mip_count = info & 0xFF;
     int array_size = (info >> 8) & 0xFF;
     if (array_size == 1 && mip_count != sub_count) mip_count = sub_count;
-    // Sub-texture offsets follow at p+12 (array_size * mip_count offsets)
-    // We only want [0,0] (first mip, first array)
-    if (sz < 12 + 4) return false;
-    uint32_t sub_offset = read_u32le(p + 12); // base-relative
-    // sub-texture: TXP2 sig, width, height, format, id, dataSize, data
-    if (sub_offset + 24 > sz) return false;
-    const uint8_t* sp = p + sub_offset;
+    if (avail < 12u + 4u) return false;
+    // Only need [0,0]: first offset in the table, relative to txp4 start
+    uint32_t sub_off = read_u32le(txp4 + 12);
+    if (sub_off + 24 > avail) return false;
+    const uint8_t* sp = txp4 + sub_off;
     if (read_u32le(sp) != 0x02505854) return false;
-    out.width = (int)read_u32le(sp + 4);
+    out.width  = (int)read_u32le(sp + 4);
     out.height = (int)read_u32le(sp + 8);
     out.format = (int)read_u32le(sp + 12);
-    // id at sp+16
     uint32_t data_size = read_u32le(sp + 20);
-    if (sub_offset + 24 + data_size > sz) return false;
+    if (sub_off + 24 + data_size > avail) return false;
     out.data.assign(sp + 24, sp + 24 + data_size);
     return true;
 }
 
-// The MTXD section contains a TextureSet which is just a sequence of TXP textures
-// preceded by a count and offset table.
-// Layout (from SpriteSet::Read + TextureSet code):
-//   TextureSet header at data_start: u32 sig(unused), u32 texturesOffset, u32 count, ...
-// Actually the SPRC data starts with its own fields. Let's read the raw .bin
-// which for DT format is structured as nested sections.
+static bool parse_bin(const std::vector<uint8_t>& bin, SpriteSetBin& out) {
+    const uint8_t* p = bin.data();
+    size_t sz = bin.size();
+    if (sz < 32) return false;
 
-// For DT .bin files (spr_sel_pv###.bin):
-// The file starts with an SPRC section, which has sub-sections ENRS and MTXD.
-// SPRC data = SpriteSet data blob (sprite structs + name offsets)
-// MTXD data = TextureSet data blob
+    // sig at [0] intentionally ignored
+    uint32_t tex_off      = read_u32le(p + 4);
+    int      tex_count    = (int)read_u32le(p + 8);
+    int      spr_count    = (int)read_u32le(p + 12);
+    uint32_t spr_off      = read_u32le(p + 16);
+    uint32_t tex_names_off = read_u32le(p + 20);
+    uint32_t spr_names_off = read_u32le(p + 24);
 
-static bool parse_sprc_data(const uint8_t* data, size_t data_sz, size_t base_offset,
-    const uint8_t* full_file, size_t full_sz,
-    SpriteSetBin& out)
-{
-    // SpriteSet::Read (section mode, DT):
-    // int signature (unused)
-    // uint texturesOffset  <- not used in section mode (sub-section handles it)
-    // int textureCount
-    // int spriteCount
-    // offset spritesOffset
-    // offset textureNamesOffset
-    // offset spriteNamesOffset
-    // offset spriteModesOffset
-    // offsets are 32-bit for DT, relative to section data start
+    auto safe = [&](uint32_t off, size_t need) -> const uint8_t* {
+        if ((size_t)off + need > sz) return nullptr;
+        return p + off;
+    };
 
-    if (data_sz < 32) return false;
-    // signature = read_u32le(data + 0);  // unused
-    // uint32_t textures_offset    = read_u32le(data + 4);  // only used if no sub-section
-    int  texture_count = (int)read_u32le(data + 8);
-    int  sprite_count = (int)read_u32le(data + 12);
-    uint32_t sprites_offset = read_u32le(data + 16);
-    uint32_t tex_names_offset = read_u32le(data + 20);
-    uint32_t spr_names_offset = read_u32le(data + 24);
-    uint32_t spr_modes_offset = read_u32le(data + 28);
-
-    // Offsets are relative to data start (base_offset)
-    auto read_at = [&](uint32_t off, size_t need) -> const uint8_t* {
-        size_t abs = base_offset + off;
-        if (abs + need > full_sz) return nullptr;
-        return full_file + abs;
-        };
-
-    // Read sprites (each Sprite = 40 bytes: u32 texIdx, u32 pad, 2xf32 rectBegin, 2xf32 rectEnd, f32 x, f32 y, f32 w, f32 h)
-    out.sprites.resize(sprite_count);
-    const uint8_t* sp = read_at(sprites_offset, sprite_count * 40);
+    // Sprites
+    out.sprites.resize(spr_count);
+    const uint8_t* sp = safe(spr_off, (size_t)spr_count * 40);
     if (!sp) return false;
-    for (int i = 0; i < sprite_count; i++) {
+    for (int i = 0; i < spr_count; i++) {
         const uint8_t* s = sp + i * 40;
         out.sprites[i].texture_index = read_u32le(s);
-        // s+4 = padding
-        // s+8..s+15 = rectBegin (unused here)
-        // s+16..s+23 = rectEnd  (unused here)
         out.sprites[i].x = read_f32le(s + 24);
         out.sprites[i].y = read_f32le(s + 28);
         out.sprites[i].w = read_f32le(s + 32);
         out.sprites[i].h = read_f32le(s + 36);
     }
 
-    // Read sprite names (array of 32-bit offsets to null-terminated strings)
-    if (spr_names_offset) {
-        const uint8_t* np = read_at(spr_names_offset, sprite_count * 4);
-        if (np) {
-            for (int i = 0; i < sprite_count; i++) {
-                uint32_t str_off = read_u32le(np + i * 4);
-                const uint8_t* s = read_at(str_off, 1);
-                if (s) out.sprites[i].name = (const char*)s;
-            }
+    // Sprite names
+    const uint8_t* snp = safe(spr_names_off, (size_t)spr_count * 4);
+    if (snp) {
+        for (int i = 0; i < spr_count; i++) {
+            uint32_t str_off = read_u32le(snp + i * 4);
+            const uint8_t* s = safe(str_off, 1);
+            if (s) out.sprites[i].name = (const char*)s;
         }
     }
 
-    // Read sprite modes (array of {u32 pad, u32 resMode} per sprite — we skip, not needed)
-    (void)spr_modes_offset;
-
-    // Textures are handled by MTXD sub-section parsing separately
-    out.textures.resize(texture_count);
-    (void)tex_names_offset; // names set via MTXD
-    return true;
-}
-
-static bool parse_mtxd_data(const uint8_t* data, size_t data_sz, size_t base_offset,
-    const uint8_t* full_file, size_t full_sz,
-    SpriteSetBin& out)
-{
-    // TextureSet data: u32 signature, u32 texturesOffset, u32 count, ...
-    // then at texturesOffset: array of u32 offsets to TXP textures
-    if (data_sz < 12) return false;
-    // uint32_t sig = read_u32le(data);
-    uint32_t tex_offset_table = read_u32le(data + 4);
-    uint32_t count = read_u32le(data + 8);
-    if (count == 0) return true;
-
-    auto abs_of = [&](uint32_t rel) -> size_t { return base_offset + rel; };
-
-    size_t table_abs = abs_of(tex_offset_table);
-    if (table_abs + count * 4 > full_sz) return false;
-
-    if (out.textures.size() < count) out.textures.resize(count);
-
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t tex_rel = read_u32le(full_file + table_abs + i * 4);
-        size_t tex_abs = abs_of(tex_rel);
-        if (tex_abs >= full_sz) continue;
-        parse_texture(full_file + tex_abs, full_sz - tex_abs, out.textures[i]);
+    // Textures via TXP3 block
+    out.textures.resize(tex_count);
+    const uint8_t* txp3 = safe(tex_off, 12);
+    if (!txp3 || read_u32le(txp3) != 0x03505854) return false;
+    uint32_t txp3_count = read_u32le(txp3 + 4);
+    if ((int)txp3_count < tex_count) tex_count = (int)txp3_count;
+    const uint8_t* txp3_table = safe(tex_off + 12, (size_t)tex_count * 4);
+    if (!txp3_table) return false;
+    for (int i = 0; i < tex_count; i++) {
+        uint32_t txp4_rel = read_u32le(txp3_table + i * 4); // relative to txp3 start
+        uint32_t txp4_abs = tex_off + txp4_rel;
+        if (txp4_abs >= sz) continue;
+        parse_texture(p + txp4_abs, sz - txp4_abs, out.textures[i]);
     }
-    return true;
-}
 
-// Walk sections in a flat buffer (depth-0 scan)
-static bool parse_bin(const std::vector<uint8_t>& bin, SpriteSetBin& out) {
-    const uint8_t* p = bin.data();
-    size_t sz = bin.size();
-    size_t pos = 0;
-
-    while (pos + 24 <= sz) {
-        char sig[5] = {};
-        memcpy(sig, p + pos, 4);
-        SecHdr hdr;
-        size_t data_start;
-        if (!parse_section_header(p, sz, pos, nullptr, hdr, data_start)) break;
-
-        if (strcmp(sig, "SPRC") == 0) {
-            // Recurse into sub-sections first (ENRS at depth 1, MTXD at depth 1)
-            // Sub-sections come after the 6-word header (24 bytes) and before data
-            size_t sub_pos = pos + 24;
-            size_t data_abs = pos + hdr.data_offset_rel;
-            while (sub_pos < data_abs && sub_pos + 24 <= sz) {
-                char ssig[5] = {};
-                memcpy(ssig, p + sub_pos, 4);
-                SecHdr shdr; size_t sdata;
-                if (!parse_section_header(p, sz, sub_pos, nullptr, shdr, sdata)) break;
-                if (strcmp(ssig, "MTXD") == 0) {
-                    size_t mtxd_data_abs = sub_pos + shdr.data_offset_rel;
-                    parse_mtxd_data(p + mtxd_data_abs, shdr.data_size,
-                        mtxd_data_abs, p, sz, out);
-                }
-                sub_pos += 24 + shdr.section_size;
-            }
-            // Now parse SPRC data
-            parse_sprc_data(p + data_abs, hdr.data_size, data_abs, p, sz, out);
+    // Texture names
+    const uint8_t* tnp = safe(tex_names_off, (size_t)tex_count * 4);
+    if (tnp) {
+        for (int i = 0; i < tex_count; i++) {
+            uint32_t str_off = read_u32le(tnp + i * 4);
+            const uint8_t* s = safe(str_off, 1);
+            if (s) out.textures[i].name = (const char*)s;
         }
-
-        pos += 24 + hdr.section_size;
-        if (hdr.section_size == 0) break; // safety
     }
+
     return !out.sprites.empty();
 }
 
+// (parse_sprc_data and parse_mtxd_data removed; Mega Mix+ bins are flat format)
+
 // ---- DXT / Block Compression Decoding ---------------------------------------
 // Minimal DXT1/DXT3/DXT5/ATI2 decoder, outputs RGBA8.
-// ATI2 (BC5 two-channel) is used for YCbCr — we handle it specially.
+// ATI2 (BC5 two-channel) is used for YCbCr ï¿½ we handle it specially.
 
 static void decode_bc1_block(const uint8_t* src, uint8_t* dst, int dst_stride) {
     uint16_t c0 = (uint16_t)(src[0] | (src[1] << 8));
@@ -647,6 +575,53 @@ static bool save_sprite_png(const std::string& path,
     return save_png(path, crop.data(), sw, sh);
 }
 
+// Crop, trim transparent border, then nearest-neighbour scale back to original crop size
+static bool save_sprite_png_trimmed(const std::string& path,
+    const std::vector<uint8_t>& rgba, int tex_w, int tex_h,
+    int sx, int sy, int sw, int sh)
+{
+    sx = std::max(0, std::min(sx, tex_w - 1));
+    sy = std::max(0, std::min(sy, tex_h - 1));
+    sw = std::max(1, std::min(sw, tex_w - sx));
+    sh = std::max(1, std::min(sh, tex_h - sy));
+
+    // Crop first
+    std::vector<uint8_t> crop(sw * sh * 4);
+    for (int y = 0; y < sh; y++)
+        memcpy(crop.data() + y * sw * 4, rgba.data() + (sy + y) * tex_w * 4 + sx * 4, sw * 4);
+
+    // Find tight bbox of non-transparent pixels
+    int tmin = sh, tmax = -1, lmin = sw, lmax = -1;
+    for (int y = 0; y < sh; y++) for (int x = 0; x < sw; x++) {
+        if (crop[(y * sw + x) * 4 + 3] > 0) {
+            if (y < tmin) tmin = y;
+            if (y > tmax) tmax = y;
+            if (x < lmin) lmin = x;
+            if (x > lmax) lmax = x;
+        }
+    }
+    if (tmax < 0) return save_png(path, crop.data(), sw, sh); // fully transparent, save as-is
+
+    int cw = lmax - lmin + 1, ch = tmax - tmin + 1;
+    if (cw == sw && ch == sh) return save_png(path, crop.data(), sw, sh); // no padding found
+
+    // Extract trimmed content
+    std::vector<uint8_t> trimmed(cw * ch * 4);
+    for (int y = 0; y < ch; y++)
+        memcpy(trimmed.data() + y * cw * 4, crop.data() + (tmin + y) * sw * 4 + lmin * 4, cw * 4);
+
+    // Scale back to original crop size (nearest-neighbour)
+    std::vector<uint8_t> scaled(sw * sh * 4);
+    for (int y = 0; y < sh; y++) {
+        int sy2 = y * ch / sh;
+        for (int x = 0; x < sw; x++) {
+            int sx2 = x * cw / sw;
+            memcpy(scaled.data() + (y * sw + x) * 4, trimmed.data() + (sy2 * cw + sx2) * 4, 4);
+        }
+    }
+    return save_png(path, scaled.data(), sw, sh);
+}
+
 // ---- mod_pv_db.txt Parser ---------------------------------------------------
 
 struct PvDifficulty {
@@ -707,7 +682,7 @@ static std::map<int, PvEntry> parse_pv_db(const std::string& path) {
         std::string rest = key.substr(dot + 1);
 
         if (rest == "bpm")                       e.bpm = val;
-        else if (rest == "date")                 e.date = val;
+        else if (rest == "date")                 e.date = sanitize_token(val);
         else if (rest == "song_name")            e.song_name = val;
         else if (rest == "song_name_en")         e.song_name_en = val;
         else if (rest == "song_name_reading")    e.song_name_reading = val;
@@ -934,7 +909,7 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
 
                             std::string* dest_var = nullptr;
                             std::string dest_file;
-                            if (upper_name == jk_target) { dest_var = &jk_png_name;   dest_file = "art.png"; }
+                            if (upper_name == jk_target) { dest_var = &jk_png_name;   dest_file = "jk.png"; }
                             else if (upper_name == bg_target) { dest_var = &bg_png_name;   dest_file = "bg.png"; }
                             else if (upper_name == logo_target) { dest_var = &logo_png_name; dest_file = "logo.png"; }
                             else continue;
@@ -943,10 +918,12 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
                             if (ti >= decoded_textures.size() || decoded_textures[ti].empty()) continue;
                             int tw = spr.textures[ti].width, th = spr.textures[ti].height;
                             fs::path out_img = song_out / dest_file;
-                            if (save_sprite_png(out_img.string(), decoded_textures[ti],
-                                tw, th,
-                                (int)spi.x, (int)spi.y, (int)spi.w, (int)spi.h))
-                            {
+                            bool ok = (dest_file == "jk.png")
+                                ? save_sprite_png_trimmed(out_img.string(), decoded_textures[ti],
+                                      tw, th, (int)spi.x, (int)spi.y, (int)spi.w, (int)spi.h)
+                                : save_sprite_png(out_img.string(), decoded_textures[ti],
+                                      tw, th, (int)spi.x, (int)spi.y, (int)spi.w, (int)spi.h);
+                            if (ok) {
                                 *dest_var = dest_file;
                                 printf("  IMG: %s (%dx%d from tex%d)\n",
                                     dest_file.c_str(), (int)spi.w, (int)spi.h, ti);
@@ -1004,8 +981,8 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
     if (!pv.music.empty())    ini << "songinfo.music=" << pv.music << "\n";
     ini << "songinfo.bpm=" << pv.bpm << "\n";
     ini << "songinfo.date=" << pv.date << "\n";
-    ini << "songinfo.previewplaytime=" << pv.sabi_play << "\n";
-    ini << "songinfo.previewstarttime=" << pv.sabi_start << "\n";
+    ini << "songinfo.previewplaytime="  << fmt_time(pv.sabi_play)  << "\n";
+    ini << "songinfo.previewstarttime=" << fmt_time(pv.sabi_start) << "\n";
     ini << "songinfo.slide=1\n";
 
     std::ofstream ini_f(song_out / "song.ini");
