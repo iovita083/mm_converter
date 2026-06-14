@@ -395,24 +395,32 @@ static std::vector<uint8_t> decode_texture(const TextureInfo& tex) {
     std::vector<uint8_t> rgba(w * h * 4, 0xFF);
     int fmt = tex.format;
     // fmt: DXT1=6, DXT1a=7, DXT3=8, DXT5=9, ATI1=10, ATI2=11, RGBA8=2, RGB8=1
-    if (fmt == 2) { // RGBA8
-        for (int i = 0; i < w * h; i++) {
-            if ((size_t)(i * 4 + 3) < tex.data.size()) {
-                rgba[i * 4 + 0] = tex.data[i * 4 + 0];
-                rgba[i * 4 + 1] = tex.data[i * 4 + 1];
-                rgba[i * 4 + 2] = tex.data[i * 4 + 2];
-                rgba[i * 4 + 3] = tex.data[i * 4 + 3];
+    if (fmt == 2) { // RGBA8 - bytes on disk: R,G,B,A, stored bottom-up
+        for (int y = 0; y < h; y++) {
+            int src_y = h - 1 - y;
+            for (int x = 0; x < w; x++) {
+                size_t si = (src_y * w + x) * 4;
+                size_t di = (y * w + x) * 4;
+                if (si + 3 >= tex.data.size()) continue;
+                rgba[di + 0] = tex.data[si + 0];
+                rgba[di + 1] = tex.data[si + 1];
+                rgba[di + 2] = tex.data[si + 2];
+                rgba[di + 3] = tex.data[si + 3];
             }
         }
         return rgba;
     }
-    if (fmt == 1) { // RGB8
-        for (int i = 0; i < w * h; i++) {
-            if ((size_t)(i * 3 + 2) < tex.data.size()) {
-                rgba[i * 4 + 0] = tex.data[i * 3 + 0];
-                rgba[i * 4 + 1] = tex.data[i * 3 + 1];
-                rgba[i * 4 + 2] = tex.data[i * 3 + 2];
-                rgba[i * 4 + 3] = 255;
+    if (fmt == 1) { // RGB8 - bytes on disk: R,G,B, stored bottom-up
+        for (int y = 0; y < h; y++) {
+            int src_y = h - 1 - y;
+            for (int x = 0; x < w; x++) {
+                size_t si = (src_y * w + x) * 3;
+                size_t di = (y * w + x) * 4;
+                if (si + 2 >= tex.data.size()) continue;
+                rgba[di + 0] = tex.data[si + 0];
+                rgba[di + 1] = tex.data[si + 1];
+                rgba[di + 2] = tex.data[si + 2];
+                rgba[di + 3] = 255;
             }
         }
         return rgba;
@@ -461,15 +469,21 @@ static std::vector<uint8_t> decode_texture(const TextureInfo& tex) {
             for (int i = 0; i < 16; i++) { block_rgba[i * 4 + 0] = ch[i]; block_rgba[i * 4 + 3] = 255; }
         }
         else if (is_ati2) {
-            // BC5: two ATI1 blocks
+            // BC5 YCbCr: ch0=Y, ch1=Cb; Cr reconstructed as 255-Cb (DIVA convention)
             uint8_t ch0[16], ch1[16];
-            decode_ati1_block(b, ch0); // Y or R
-            decode_ati1_block(b + 8, ch1); // CbCr or G
-            // For YCbCr textures MikuMikuLibrary uses IsYCbCr flag when ATI2+1array+2mips,
-            // but for sprite sheets it's just regular BC5 RGB. We treat as BC5 (R=ch0, G=ch1).
+            decode_ati1_block(b, ch0);
+            decode_ati1_block(b + 8, ch1);
             for (int i = 0; i < 16; i++) {
-                block_rgba[i * 4 + 0] = ch0[i]; block_rgba[i * 4 + 1] = ch1[i];
-                block_rgba[i * 4 + 2] = 0; block_rgba[i * 4 + 3] = 255;
+                float Y  = ch0[i];
+                float Cb = ch1[i];
+                float Cr = 255.0f - Cb;
+                float R = Y + 1.402f * (Cr - 128.0f);
+                float G = Y - 0.344f * (Cb - 128.0f) - 0.714f * (Cr - 128.0f);
+                float B = Y + 1.772f * (Cb - 128.0f);
+                block_rgba[i*4+0] = (uint8_t)std::max(0.0f, std::min(255.0f, R));
+                block_rgba[i*4+1] = (uint8_t)std::max(0.0f, std::min(255.0f, G));
+                block_rgba[i*4+2] = (uint8_t)std::max(0.0f, std::min(255.0f, B));
+                block_rgba[i*4+3] = 255;
             }
         }
         // Copy block to output, flipped (textures are stored upside-down)
@@ -575,7 +589,7 @@ static bool save_sprite_png(const std::string& path,
     return save_png(path, crop.data(), sw, sh);
 }
 
-// Crop, trim transparent border, then nearest-neighbour scale back to original crop size
+// Crop, trim transparent border, center content in a square canvas.
 static bool save_sprite_png_trimmed(const std::string& path,
     const std::vector<uint8_t>& rgba, int tex_w, int tex_h,
     int sx, int sy, int sw, int sh)
@@ -585,41 +599,31 @@ static bool save_sprite_png_trimmed(const std::string& path,
     sw = std::max(1, std::min(sw, tex_w - sx));
     sh = std::max(1, std::min(sh, tex_h - sy));
 
-    // Crop first
     std::vector<uint8_t> crop(sw * sh * 4);
     for (int y = 0; y < sh; y++)
         memcpy(crop.data() + y * sw * 4, rgba.data() + (sy + y) * tex_w * 4 + sx * 4, sw * 4);
 
-    // Find tight bbox of non-transparent pixels
+    // Tight bbox
     int tmin = sh, tmax = -1, lmin = sw, lmax = -1;
     for (int y = 0; y < sh; y++) for (int x = 0; x < sw; x++) {
         if (crop[(y * sw + x) * 4 + 3] > 0) {
-            if (y < tmin) tmin = y;
-            if (y > tmax) tmax = y;
-            if (x < lmin) lmin = x;
-            if (x > lmax) lmax = x;
+            if (y < tmin) tmin = y; if (y > tmax) tmax = y;
+            if (x < lmin) lmin = x; if (x > lmax) lmax = x;
         }
     }
-    if (tmax < 0) return save_png(path, crop.data(), sw, sh); // fully transparent, save as-is
+    if (tmax < 0) return save_png(path, crop.data(), sw, sh);
 
     int cw = lmax - lmin + 1, ch = tmax - tmin + 1;
-    if (cw == sw && ch == sh) return save_png(path, crop.data(), sw, sh); // no padding found
+    int side = std::max(cw, ch);
 
-    // Extract trimmed content
-    std::vector<uint8_t> trimmed(cw * ch * 4);
+    // Center trimmed content on a square transparent canvas
+    std::vector<uint8_t> square(side * side * 4, 0);
+    int ox = (side - cw) / 2, oy = (side - ch) / 2;
     for (int y = 0; y < ch; y++)
-        memcpy(trimmed.data() + y * cw * 4, crop.data() + (tmin + y) * sw * 4 + lmin * 4, cw * 4);
+        memcpy(square.data() + ((oy + y) * side + ox) * 4,
+               crop.data() + ((tmin + y) * sw + lmin) * 4, cw * 4);
 
-    // Scale back to original crop size (nearest-neighbour)
-    std::vector<uint8_t> scaled(sw * sh * 4);
-    for (int y = 0; y < sh; y++) {
-        int sy2 = y * ch / sh;
-        for (int x = 0; x < sw; x++) {
-            int sx2 = x * cw / sw;
-            memcpy(scaled.data() + (y * sw + x) * 4, trimmed.data() + (sy2 * cw + sx2) * 4, 4);
-        }
-    }
-    return save_png(path, scaled.data(), sw, sh);
+    return save_png(path, square.data(), side, side);
 }
 
 // ---- mod_pv_db.txt Parser ---------------------------------------------------
