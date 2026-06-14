@@ -6,7 +6,7 @@ An automated tool to convert mod song packs for *Hatsune Miku: Project DIVA Mega
 ## Installation & Use
 
 1. Ensure [FFmpeg](https://ffmpeg.org/) is installed and added to your system `PATH`.
-2. Download [UsmToolkit](https://github.com/Rikux3/UsmToolkit). Place the `mm_converter.exe` in the same directory as `UsmToolkit` (or ensure `UsmToolkit` is in your system `PATH`).
+2. Download [UsmToolkit](https://github.com/Rikux3/UsmToolkit) and setup its dependencies. Place the `mm_converter.exe` in the same directory as `UsmToolkit.exe` (or ensure `UsmToolkit.exe` is in your system `PATH`).
 3. Run `mm_converter.exe`.
 4.
    - Select your "Mods" source folder and "Output" folder (the tool will attempt to auto-detect these).
