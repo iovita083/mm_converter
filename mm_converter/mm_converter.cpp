@@ -967,39 +967,77 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
                         for (auto& t : spr.textures)
                             decoded_textures.push_back(decode_texture(t));
 
-                        // Find and save named sprites
                         char pvs[16]; snprintf(pvs, sizeof(pvs), "%d", pv.id);
                         std::string jk_target = "SONG_JK" + std::string(pvs);
                         std::string bg_target = "SONG_BG" + std::string(pvs);
                         std::string logo_target = "SONG_LOGO" + std::string(pvs);
 
+                        bool skipped_bg_due_to_image = false;
+
+                        // Check for "IMAGE" override first (modders usualy add them as higher res bg images)
                         for (auto& spi : spr.sprites) {
                             std::string upper_name = spi.name;
                             for (auto& c : upper_name) c = (char)toupper(c);
 
-                            std::string* dest_var = nullptr;
-                            std::string dest_file;
-                            if (upper_name == jk_target) { dest_var = &jk_png_name;   dest_file = "jk.png"; }
-                            else if (upper_name == bg_target) { dest_var = &bg_png_name;   dest_file = "bg.png"; }
-                            else if (upper_name == logo_target) { dest_var = &logo_png_name; dest_file = "logo.png"; }
-                            else continue;
-
-                            uint32_t ti = spi.texture_index;
-                            if (ti >= decoded_textures.size() || decoded_textures[ti].empty()) continue;
-                            int tw = spr.textures[ti].width, th = spr.textures[ti].height;
-                            fs::path out_img = song_out / dest_file;
-                            bool ok = (dest_file == "jk.png")
-                                ? save_sprite_png_trimmed(out_img.string(), decoded_textures[ti],
-                                      tw, th, (int)spi.x, (int)spi.y, (int)spi.w, (int)spi.h)
-                                : save_sprite_png(out_img.string(), decoded_textures[ti],
-                                      tw, th, (int)spi.x, (int)spi.y, (int)spi.w, (int)spi.h);
-                            if (ok) {
-                                *dest_var = dest_file;
-                                printf("  IMG: %s (%dx%d from tex%d)\n",
-                                    dest_file.c_str(), (int)spi.w, (int)spi.h, ti);
+                            if (upper_name == "IMAGE") {
+                                uint32_t ti = spi.texture_index;
+                                if (ti >= decoded_textures.size() || decoded_textures[ti].empty()) continue;
+                                int tw = spr.textures[ti].width, th = spr.textures[ti].height;
+                                fs::path out_img = song_out / "bg.png";
+                                if (save_sprite_png(out_img.string(), decoded_textures[ti], tw, th, (int)spi.x, (int)spi.y, (int)spi.w, (int)spi.h)) {
+                                    bg_png_name = "bg.png";
+                                    skipped_bg_due_to_image = true;
+                                    printf("  IMG: bg.png (High-res override from 'IMAGE' sprite, %dx%d from tex%d)\n", (int)spi.w, (int)spi.h, ti);
+                                    break;
+                                }
                             }
-                            else {
-                                fprintf(stderr, "  WARN: Failed to save %s\n", dest_file.c_str());
+                        }
+
+                        // Process target IDs or default templates (001)
+                        auto process_sprite = [&](const SpriteInfo& spi, const std::string& target_file, bool trim_image) {
+                            uint32_t ti = spi.texture_index;
+                            if (ti >= decoded_textures.size() || decoded_textures[ti].empty()) return false;
+                            int tw = spr.textures[ti].width, th = spr.textures[ti].height;
+                            fs::path out_img = song_out / target_file;
+                            bool ok = trim_image
+                                ? save_sprite_png_trimmed(out_img.string(), decoded_textures[ti], tw, th, (int)spi.x, (int)spi.y, (int)spi.w, (int)spi.h)
+                                : save_sprite_png(out_img.string(), decoded_textures[ti], tw, th, (int)spi.x, (int)spi.y, (int)spi.w, (int)spi.h);
+                            if (ok) {
+                                printf("  IMG: %s (%dx%d from tex%d)\n", target_file.c_str(), (int)spi.w, (int)spi.h, ti);
+                                return true;
+                            }
+                            return false;
+                            };
+
+                        // First run: Look for precise ID matches
+                        for (auto& spi : spr.sprites) {
+                            std::string upper_name = spi.name;
+                            for (auto& c : upper_name) c = (char)toupper(c);
+
+                            if (upper_name == jk_target && jk_png_name.empty()) {
+                                if (process_sprite(spi, "jk.png", true)) jk_png_name = "jk.png";
+                            }
+                            else if (upper_name == bg_target && bg_png_name.empty() && !skipped_bg_due_to_image) {
+                                if (process_sprite(spi, "bg.png", false)) bg_png_name = "bg.png";
+                            }
+                            else if (upper_name == logo_target && logo_png_name.empty()) {
+                                if (process_sprite(spi, "logo.png", false)) logo_png_name = "logo.png";
+                            }
+                        }
+
+                        // Second run fallback: Look for unrenamed "001" templates if precise IDs weren't found
+                        for (auto& spi : spr.sprites) {
+                            std::string upper_name = spi.name;
+                            for (auto& c : upper_name) c = (char)toupper(c);
+
+                            if (upper_name == "SONG_JK001" && jk_png_name.empty()) {
+                                if (process_sprite(spi, "jk.png", true)) jk_png_name = "jk.png";
+                            }
+                            else if (upper_name == "SONG_BG001" && bg_png_name.empty() && !skipped_bg_due_to_image) {
+                                if (process_sprite(spi, "bg.png", false)) bg_png_name = "bg.png";
+                            }
+                            else if (upper_name == "SONG_LOGO001" && logo_png_name.empty()) {
+                                if (process_sprite(spi, "logo.png", false)) logo_png_name = "logo.png";
                             }
                         }
                     }
@@ -1051,7 +1089,7 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
     if (!pv.music.empty())    ini << "songinfo.music=" << pv.music << "\n";
     ini << "songinfo.bpm=" << pv.bpm << "\n";
     ini << "songinfo.date=" << pv.date << "\n";
-    ini << "songinfo.previewplaytime="  << fmt_time(pv.sabi_play)  << "\n";
+    ini << "songinfo.previewplaytime=" << fmt_time(pv.sabi_play) << "\n";
     ini << "songinfo.previewstarttime=" << fmt_time(pv.sabi_start) << "\n";
     ini << "songinfo.slide=1\n";
 
@@ -1059,7 +1097,6 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
     ini_f << ini.str();
     printf("  INI: song.ini written\n");
 }
-
 // ---- Main -------------------------------------------------------------------
 
 static void print_usage(const char* argv0) {
