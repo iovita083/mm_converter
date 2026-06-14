@@ -207,8 +207,12 @@ struct SpriteInfo {
 struct TextureInfo {
     std::string name;
     int width, height;
-    int format; // TextureFormat enum value
-    std::vector<uint8_t> data; // raw compressed pixels
+    int format;
+    std::vector<uint8_t> data;
+    // YCbCr only: second sub-texture (chroma, half-size BC5)
+    int chroma_width = 0, chroma_height = 0;
+    std::vector<uint8_t> chroma_data;
+    bool is_ycbcr = false;
 };
 
 struct SpriteSetBin {
@@ -241,6 +245,23 @@ struct SpriteSetBin {
 //   [0] u32 0x02505854, [4] u32 width, [8] u32 height, [12] u32 format,
 //   [16] u32 id, [20] u32 dataSize, [24..] pixel data
 
+static bool parse_subtexture(const uint8_t* txp4, size_t avail, uint32_t sub_idx,
+    int& w, int& h, int& fmt, std::vector<uint8_t>& data)
+{
+    if (avail < 12u + (sub_idx + 1) * 4u) return false;
+    uint32_t sub_off = read_u32le(txp4 + 12 + sub_idx * 4);
+    if (sub_off + 24 > avail) return false;
+    const uint8_t* sp = txp4 + sub_off;
+    if (read_u32le(sp) != 0x02505854) return false;
+    w   = (int)read_u32le(sp + 4);
+    h   = (int)read_u32le(sp + 8);
+    fmt = (int)read_u32le(sp + 12);
+    uint32_t data_size = read_u32le(sp + 20);
+    if (sub_off + 24 + data_size > avail) return false;
+    data.assign(sp + 24, sp + 24 + data_size);
+    return true;
+}
+
 static bool parse_texture(const uint8_t* txp4, size_t avail, TextureInfo& out) {
     if (avail < 16) return false;
     uint32_t sig = read_u32le(txp4);
@@ -250,18 +271,18 @@ static bool parse_texture(const uint8_t* txp4, size_t avail, TextureInfo& out) {
     int mip_count = info & 0xFF;
     int array_size = (info >> 8) & 0xFF;
     if (array_size == 1 && mip_count != sub_count) mip_count = sub_count;
-    if (avail < 12u + 4u) return false;
-    // Only need [0,0]: first offset in the table, relative to txp4 start
-    uint32_t sub_off = read_u32le(txp4 + 12);
-    if (sub_off + 24 > avail) return false;
-    const uint8_t* sp = txp4 + sub_off;
-    if (read_u32le(sp) != 0x02505854) return false;
-    out.width  = (int)read_u32le(sp + 4);
-    out.height = (int)read_u32le(sp + 8);
-    out.format = (int)read_u32le(sp + 12);
-    uint32_t data_size = read_u32le(sp + 20);
-    if (sub_off + 24 + data_size > avail) return false;
-    out.data.assign(sp + 24, sp + 24 + data_size);
+
+    int fmt0 = 0;
+    if (!parse_subtexture(txp4, avail, 0, out.width, out.height, fmt0, out.data))
+        return false;
+    out.format = fmt0;
+
+    // YCbCr: ATI2, array_size==1, mip_count==2 (luma mip0, chroma mip1)
+    if (fmt0 == 11 && array_size == 1 && mip_count == 2 && sub_count >= 2) {
+        int cfmt = 0;
+        if (parse_subtexture(txp4, avail, 1, out.chroma_width, out.chroma_height, cfmt, out.chroma_data))
+            out.is_ycbcr = true;
+    }
     return true;
 }
 
@@ -389,12 +410,63 @@ static void decode_ati1_block(const uint8_t* src, uint8_t* ch_out /*16 bytes*/) 
 
 
 
+// Decode one BC5 channel block (same as ATI1/BC4)
+static void decode_bc5_channel(const uint8_t* src, int w, int h, std::vector<float>& ch0, std::vector<float>& ch1) {
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    ch0.resize(w * h); ch1.resize(w * h);
+    for (int by = 0; by < bh; by++) for (int bx = 0; bx < bw; bx++) {
+        const uint8_t* b = src + (by * bw + bx) * 16;
+        uint8_t a0[16], a1[16];
+        decode_bc3_alpha_block(b,     a0);
+        decode_bc3_alpha_block(b + 8, a1);
+        for (int py = 0; py < 4; py++) for (int px = 0; px < 4; px++) {
+            int ox = bx*4+px, oy = by*4+py;
+            if (ox >= w || oy >= h) continue;
+            ch0[oy*w+ox] = a0[py*4+px] / 255.0f;
+            ch1[oy*w+ox] = a1[py*4+px] / 255.0f;
+        }
+    }
+}
+
+// Bilinear sample of a float buffer at sub-pixel coords
+static float bilinear(const std::vector<float>& buf, int bw, int bh, float u, float v) {
+    float fx = u * bw - 0.5f, fy = v * bh - 0.5f;
+    int x0 = (int)fx, y0 = (int)fy;
+    int x1 = x0 + 1, y1 = y0 + 1;
+    float tx = fx - x0, ty = fy - y0;
+    auto get = [&](int x, int y) { return buf[std::max(0,std::min(y,bh-1))*bw + std::max(0,std::min(x,bw-1))]; };
+    return (get(x0,y0)*(1-tx) + get(x1,y0)*tx)*(1-ty) + (get(x0,y1)*(1-tx) + get(x1,y1)*tx)*ty;
+}
+
 // Decode a full texture to RGBA8. Returns empty on failure.
 static std::vector<uint8_t> decode_texture(const TextureInfo& tex) {
     int w = tex.width, h = tex.height;
     std::vector<uint8_t> rgba(w * h * 4, 0xFF);
     int fmt = tex.format;
     // fmt: DXT1=6, DXT1a=7, DXT3=8, DXT5=9, ATI1=10, ATI2=11, RGBA8=2, RGB8=1
+
+    // YCbCr: luma BC5 (R=Y, G=alpha) + half-res chroma BC5 (R=Cb, G=Cr), Rec.709
+    if (tex.is_ycbcr && !tex.chroma_data.empty()) {
+        std::vector<float> lY, lA, cCb, cCr;
+        decode_bc5_channel(tex.data.data(), w, h, lY, lA);
+        decode_bc5_channel(tex.chroma_data.data(), tex.chroma_width, tex.chroma_height, cCb, cCr);
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+            float u = (x + 0.5f) / w, v = (y + 0.5f) / h;
+            float Y  = lY[y*w+x];
+            float A  = lA[y*w+x];
+            float Cb = bilinear(cCb, tex.chroma_width, tex.chroma_height, u, v) * 1.003922f - 0.503929f;
+            float Cr = bilinear(cCr, tex.chroma_width, tex.chroma_height, u, v) * 1.003922f - 0.503929f;
+            auto clamp01 = [](float f) { return std::max(0.0f, std::min(1.0f, f)); };
+            uint8_t R = (uint8_t)(clamp01(Y + 1.5748f * Cr) * 255.0f);
+            uint8_t G = (uint8_t)(clamp01(Y - 0.1873f * Cb - 0.4681f * Cr) * 255.0f);
+            uint8_t B = (uint8_t)(clamp01(Y + 1.8556f * Cb) * 255.0f);
+            uint8_t Ao = (uint8_t)(clamp01(A) * 255.0f);
+            int dst_y = h - 1 - y; // bottom-up, same as RGBA8
+            int idx = (dst_y*w+x)*4;
+            rgba[idx+0] = R; rgba[idx+1] = G; rgba[idx+2] = B; rgba[idx+3] = Ao;
+        }
+        return rgba;
+    }
     if (fmt == 2) { // RGBA8 - bytes on disk: R,G,B,A, stored bottom-up
         for (int y = 0; y < h; y++) {
             int src_y = h - 1 - y;
@@ -469,20 +541,14 @@ static std::vector<uint8_t> decode_texture(const TextureInfo& tex) {
             for (int i = 0; i < 16; i++) { block_rgba[i * 4 + 0] = ch[i]; block_rgba[i * 4 + 3] = 255; }
         }
         else if (is_ati2) {
-            // BC5 YCbCr: ch0=Y, ch1=Cb; Cr reconstructed as 255-Cb (DIVA convention)
+            // Plain BC5 (non-YCbCr): store RG, fill B=0, A=255
             uint8_t ch0[16], ch1[16];
             decode_ati1_block(b, ch0);
             decode_ati1_block(b + 8, ch1);
             for (int i = 0; i < 16; i++) {
-                float Y  = ch0[i];
-                float Cb = ch1[i];
-                float Cr = 255.0f - Cb;
-                float R = Y + 1.402f * (Cr - 128.0f);
-                float G = Y - 0.344f * (Cb - 128.0f) - 0.714f * (Cr - 128.0f);
-                float B = Y + 1.772f * (Cb - 128.0f);
-                block_rgba[i*4+0] = (uint8_t)std::max(0.0f, std::min(255.0f, R));
-                block_rgba[i*4+1] = (uint8_t)std::max(0.0f, std::min(255.0f, G));
-                block_rgba[i*4+2] = (uint8_t)std::max(0.0f, std::min(255.0f, B));
+                block_rgba[i*4+0] = ch0[i];
+                block_rgba[i*4+1] = ch1[i];
+                block_rgba[i*4+2] = 0;
                 block_rgba[i*4+3] = 255;
             }
         }
