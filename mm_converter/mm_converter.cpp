@@ -1,6 +1,6 @@
 // mm_converter.cpp
 // Converts Project DIVA Mega Mix+ song mods to MicroMix+ format.
-// Deps: zlib (FARC decompression). FFmpeg and UsmToolkit must be in PATH.
+// Deps: zlib (FARC decompression). FFmpeg must be in PATH.
 
 #include <cstdio>
 #include <cstdint>
@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <cstdarg>
 #include <zlib.h>
+#include "usm_demux.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -822,7 +823,6 @@ enum class FfmpegEncoder { CPU, NVENC };
 enum class FfmpegQuality { Low, Normal, High };
 
 struct ConvOptions {
-    std::string usmtoolkit = "UsmToolkit";
     bool skip_video = false;
     bool verbose = false;
     FfmpegEncoder encoder = FfmpegEncoder::NVENC;
@@ -877,23 +877,14 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
             printf("  USM: %s\n", src_usm.filename().string().c_str());
             std::string tmp_dir = (song_out / "_tmp_usm").string();
             fs::create_directories(tmp_dir);
-            std::string usm_str = src_usm.string();
-            fs::path usm_copy = fs::path(tmp_dir) / src_usm.filename();
-            fs::copy_file(src_usm, usm_copy, fs::copy_options::overwrite_existing);
-            run(opts.usmtoolkit + " extract \"" + usm_copy.string() + "\"");
+            auto dr = usm::demux(src_usm.string(), tmp_dir);
+            if (!dr.error.empty())
+                fprintf(stderr, "  WARN: USM demux error: %s\n", dr.error.c_str());
 
-            std::string m2v_path, adx_path;
-            for (auto& de : fs::directory_iterator(tmp_dir)) {
-                std::string fn = to_lower(de.path().filename().string());
-                if (ends_with_ci(fn, ".m2v")) m2v_path = de.path().string();
-                if (ends_with_ci(fn, ".adx") || ends_with_ci(fn, ".hca") ||
-                    ends_with_ci(fn, ".wav") || ends_with_ci(fn, ".aac"))
-                    adx_path = de.path().string();
-            }
+            std::string m2v_path = dr.video_path;
             if (!m2v_path.empty()) {
                 std::string out_mp4 = (song_out / "song.mp4").string();
-                std::string ffcmd = "ffmpeg -y -i \"" + m2v_path + "\"";
-                if (!adx_path.empty()) ffcmd += " -i \"" + adx_path + "\"";
+                std::string ffcmd = "ffmpeg -y -loglevel warning -stats -i \"" + m2v_path + "\"";
 
                 if (opts.encoder == FfmpegEncoder::NVENC) {
                     // quality: low=cq28, normal=cq20, high=cq14
@@ -908,8 +899,7 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
                     ffcmd += " -c:v libx264 -preset medium -crf " + std::to_string(crf) + " -pix_fmt yuv420p";
                 }
 
-                if (!adx_path.empty()) ffcmd += " -c:a aac -b:a 192k";
-                ffcmd += " \"" + out_mp4 + "\"";
+                ffcmd += " -an \"" + out_mp4 + "\"";
                 run(ffcmd);
             }
             else {
@@ -1121,6 +1111,7 @@ struct LoadedSong {
 };
 
 std::vector<LoadedSong> g_Songs;
+bool g_UpdatingList = false; // suppresses LVN_ITEMCHANGED sync during ApplyFilter
 std::atomic<bool> g_IsRunning = false;
 
 std::string BrowseFolder(HWND owner, const char* title) {
@@ -1140,9 +1131,9 @@ std::string BrowseFolder(HWND owner, const char* title) {
             if (SUCCEEDED(pfd->GetResult(&psi))) {
                 PWSTR pszPath;
                 if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath))) {
-                    int size = WideCharToMultiByte(CP_UTF8, 0, pszPath, -1, NULL, 0, NULL, NULL);
+                    int size = WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)pszPath, -1, NULL, 0, NULL, NULL);
                     std::string result(size - 1, 0);
-                    WideCharToMultiByte(CP_UTF8, 0, pszPath, -1, &result[0], size, NULL, NULL);
+                    WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)pszPath, -1, &result[0], size, NULL, NULL);
                     CoTaskMemFree(pszPath);
                     psi->Release();
                     pfd->Release();
@@ -1180,6 +1171,7 @@ std::vector<std::string> collect_mod_roots(const std::string& path) {
 }
 
 void ApplyFilter() {
+    g_UpdatingList = true;
     ListView_DeleteAllItems(g_hList);
     char query[256];
     GetWindowTextA(g_hSearch, query, 256);
@@ -1201,14 +1193,41 @@ void ApplyFilter() {
         ListView_InsertItem(g_hList, &lvi);
         ListView_SetCheckState(g_hList, lvi.iItem, g_Songs[i].selected);
     }
+    g_UpdatingList = false;
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         // Inside case WM_CREATE:
-        HFONT hFont = CreateFontA(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
-        HFONT hLogFont = CreateFontA(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FIXED_PITCH, "Consolas");
+        HBRUSH hBrush = CreateSolidBrush(RGB(240, 240, 240));  // Light gray instead of default
+        SetClassLongPtr(hwnd, GCLP_HBRBACKGROUND, (LONG_PTR)hBrush);
+
+        HFONT hFont = CreateFontA(
+            -11,                              // Negative = size in points
+            0, 0, 0,
+            FW_NORMAL,
+            FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,               // Already using this
+            DEFAULT_PITCH,
+            "Segoe UI"                        // Modern Windows font
+        );
+
+        HFONT hLogFont = CreateFontA(
+            -11,
+            0, 0, 0,
+            FW_NORMAL,
+            FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            FIXED_PITCH,
+            "Segoe UI"
+        );
 
         // Change the parameter name from 'h' to 'height' to avoid redefinition conflicts
         auto createCtrl = [&](const char* cls, const char* txt, DWORD style, int x, int y, int width, int height, int id) -> HWND {
@@ -1375,6 +1394,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         MoveWindow(g_hRunBtn, 10, h - 145, 150, 30, TRUE);
         MoveWindow(g_hLog, 10, h - 105, w - 20, 95, TRUE);
+        break;
+    }
+
+    case WM_NOTIFY: {
+        LPNMHDR pnmhdr = (LPNMHDR)lParam;
+        if (pnmhdr->hwndFrom == g_hList && pnmhdr->code == LVN_ITEMCHANGED) {
+            LPNMLISTVIEW pnmlv = (LPNMLISTVIEW)lParam;
+            if (!g_UpdatingList && (pnmlv->uChanged & LVIF_STATE) && (pnmlv->uNewState & LVIS_STATEIMAGEMASK)) {
+                // Sync the checkbox state back to g_Songs
+                LVITEMA lvi = { 0 }; lvi.mask = LVIF_PARAM; lvi.iItem = pnmlv->iItem;
+                ListView_GetItem(g_hList, &lvi);
+                g_Songs[lvi.lParam].selected = ListView_GetCheckState(g_hList, pnmlv->iItem);
+            }
+        }
         break;
     }
 
