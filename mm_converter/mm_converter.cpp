@@ -819,14 +819,9 @@ static std::map<int, PvEntry> parse_pv_db(const std::string& path) {
 
 // ---- Conversion Logic -------------------------------------------------------
 
-enum class FfmpegEncoder { CPU, NVENC };
-enum class FfmpegQuality { Low, Normal, High };
-
 struct ConvOptions {
     bool skip_video = false;
     bool verbose = false;
-    FfmpegEncoder encoder = FfmpegEncoder::NVENC;
-    FfmpegQuality quality = FfmpegQuality::Normal;
 };
 
 static void convert_song(const fs::path& mod_root, const PvEntry& pv,
@@ -884,24 +879,12 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
             std::string m2v_path = dr.video_path;
             if (!m2v_path.empty()) {
                 std::string out_mp4 = (song_out / "song.mp4").string();
-                std::string ffcmd = "ffmpeg -y -loglevel warning -stats -i \"" + m2v_path + "\"";
 
-                if (opts.encoder == FfmpegEncoder::NVENC) {
-                    // quality: low=cq28, normal=cq20, high=cq14
-                    int cq = (opts.quality == FfmpegQuality::Low) ? 28
-                        : (opts.quality == FfmpegQuality::High) ? 14 : 20;
-                    ffcmd += " -c:v h264_nvenc -preset p4 -cq " + std::to_string(cq) + " -pix_fmt yuv420p";
-                }
-                else {
-                    // quality: low=crf28, normal=crf20, high=crf14
-                    int crf = (opts.quality == FfmpegQuality::Low) ? 28
-                        : (opts.quality == FfmpegQuality::High) ? 14 : 20;
-                    ffcmd += " -c:v libx264 -preset medium -crf " + std::to_string(crf) + " -pix_fmt yuv420p";
-                }
+                std::string ffcmd = "ffmpeg -y -loglevel warning -stats -i \"" + m2v_path + "\" -c:v copy -an \"" + out_mp4 + "\"";
 
-                ffcmd += " -an \"" + out_mp4 + "\"";
                 run(ffcmd);
             }
+
             else {
                 fprintf(stderr, "  WARN: USM demux produced no m2v in %s\n", tmp_dir.c_str());
             }
@@ -1091,7 +1074,7 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
 // ---- Native Win32 GUI Implementation ----------------------------------------
 
 HWND g_hMain, g_hEditMod, g_hEditOut, g_hSearch, g_hList, g_hRunBtn;
-HWND g_hChkSkipVideo, g_hCmbQuality, g_hCmbEncoder;
+HWND g_hChkSkipVideo;
 
 // Try every drive letter for "X:\SteamLibrary\steamapps\common\Hatsune Miku Project DIVA Mega Mix Plus\mods"
 static std::string AutoDetectModsFolder() {
@@ -1241,37 +1224,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         createCtrl("STATIC", "Mods Folder:", 0, 10, 15, 90, 20, 0);
         g_hEditMod = createCtrl("EDIT", "", WS_BORDER | ES_AUTOHSCROLL, 100, 10, 400, 25, 1);
         createCtrl("BUTTON", "Browse...", 0, 510, 10, 80, 25, 2);
-
         createCtrl("STATIC", "Output Folder:", 0, 10, 45, 90, 20, 0);
         g_hEditOut = createCtrl("EDIT", "", WS_BORDER | ES_AUTOHSCROLL, 100, 40, 400, 25, 3);
         createCtrl("BUTTON", "Browse...", 0, 510, 40, 80, 25, 4);
 
-        createCtrl("STATIC", "Quality:", 0, 10, 73, 50, 20, 0);
-        g_hCmbQuality = createCtrl("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, 60, 70, 90, 100, 11);
-        SendMessageA(g_hCmbQuality, CB_ADDSTRING, 0, (LPARAM)"Low");
-        SendMessageA(g_hCmbQuality, CB_ADDSTRING, 0, (LPARAM)"Normal");
-        SendMessageA(g_hCmbQuality, CB_ADDSTRING, 0, (LPARAM)"High");
-        SendMessageA(g_hCmbQuality, CB_SETCURSEL, 1, 0); // default Normal
+        createCtrl("STATIC", "Search:", 0, 10, 77, 50, 20, 0);
+        g_hSearch = createCtrl("EDIT", "", WS_BORDER | ES_AUTOHSCROLL, 60, 75, 200, 25, 6);
+        createCtrl("BUTTON", "Select All", 0, 270, 75, 80, 25, 7);
+        createCtrl("BUTTON", "Deselect All", 0, 360, 75, 80, 25, 8);
 
-        createCtrl("STATIC", "Encoder:", 0, 162, 73, 55, 20, 0);
-        g_hCmbEncoder = createCtrl("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, 218, 70, 110, 100, 12);
-        SendMessageA(g_hCmbEncoder, CB_ADDSTRING, 0, (LPARAM)"H.264 (CPU)");
-        SendMessageA(g_hCmbEncoder, CB_ADDSTRING, 0, (LPARAM)"H.264 (NVENC)");
-        SendMessageA(g_hCmbEncoder, CB_SETCURSEL, 1, 0); // default NVENC
-
-        g_hChkSkipVideo = createCtrl("BUTTON", "Skip movie encode", BS_AUTOCHECKBOX, 340, 74, 150, 20, 5);
-
-        createCtrl("STATIC", "Search:", 0, 10, 105, 50, 20, 0);
-        g_hSearch = createCtrl("EDIT", "", WS_BORDER | ES_AUTOHSCROLL, 60, 100, 200, 25, 6);
-        createCtrl("BUTTON", "Select All", 0, 270, 100, 80, 25, 7);
-        createCtrl("BUTTON", "Deselect All", 0, 360, 100, 80, 25, 8);
-
+        g_hChkSkipVideo = createCtrl("BUTTON", "Skip movies", BS_AUTOCHECKBOX, 450, 77, 150, 20, 5);
         g_hList = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SHOWSELALWAYS, 10, 130, 580, 200, hwnd, (HMENU)9, NULL, NULL);
         ListView_SetExtendedListViewStyle(g_hList, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
         SendMessage(g_hList, WM_SETFONT, (WPARAM)hFont, TRUE);
         LVCOLUMNA col = { LVCF_WIDTH, 0, 550 };
         ListView_InsertColumn(g_hList, 0, &col);
-
         g_hRunBtn = createCtrl("BUTTON", "Convert Selected", 0, 10, 340, 150, 30, 10);
 
         g_hLog = createCtrl("EDIT", "", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 10, 380, 580, 130, 100);
@@ -1337,8 +1304,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
 
             bool skipVideo = SendMessage(g_hChkSkipVideo, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            int qualSel = (int)SendMessage(g_hCmbQuality, CB_GETCURSEL, 0, 0);
-            int encSel = (int)SendMessage(g_hCmbEncoder, CB_GETCURSEL, 0, 0);
 
             std::vector<LoadedSong> jobs;
             for (auto& s : g_Songs) if (s.selected) jobs.push_back(s);
@@ -1351,11 +1316,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             EnableWindow(g_hRunBtn, FALSE);
             std::string outStr = outPath;
 
-            std::thread([jobs, outStr, skipVideo, qualSel, encSel]() {
+            std::thread([jobs, outStr, skipVideo]() {
                 ConvOptions opts;
                 opts.skip_video = skipVideo;
-                opts.quality = (qualSel == 0) ? FfmpegQuality::Low : (qualSel == 2) ? FfmpegQuality::High : FfmpegQuality::Normal;
-                opts.encoder = (encSel == 0) ? FfmpegEncoder::CPU : FfmpegEncoder::NVENC;
 
                 int done = 0;
                 for (const auto& job : jobs) {
@@ -1383,20 +1346,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         MoveWindow(GetDlgItem(hwnd, 2), w - 90, 10, 80, 25, TRUE);
         MoveWindow(g_hEditOut, 100, 40, w - 200, 25, TRUE);
         MoveWindow(GetDlgItem(hwnd, 4), w - 90, 40, 80, 25, TRUE);
-
-        // Row 3: Quality | Encoder | Skip checkbox (right-anchored)
-        MoveWindow(g_hCmbQuality, 60, 70, 90, 100, TRUE);
-        MoveWindow(g_hCmbEncoder, 218, 70, 110, 100, TRUE);
-        MoveWindow(g_hChkSkipVideo, 218 + 110 + 10, 74, 150, 20, TRUE);
-
-        MoveWindow(g_hList, 10, 130, w - 20, h - 280, TRUE);
+        MoveWindow(g_hChkSkipVideo, 450, 77, 150, 20, TRUE);
+        MoveWindow(g_hList, 10, 110, w - 20, h - 260, TRUE);
         ListView_SetColumnWidth(g_hList, 0, w - 40);
-
         MoveWindow(g_hRunBtn, 10, h - 145, 150, 30, TRUE);
         MoveWindow(g_hLog, 10, h - 105, w - 20, 95, TRUE);
         break;
     }
-
     case WM_NOTIFY: {
         LPNMHDR pnmhdr = (LPNMHDR)lParam;
         if (pnmhdr->hwndFrom == g_hList && pnmhdr->code == LVN_ITEMCHANGED) {
