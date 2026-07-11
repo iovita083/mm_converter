@@ -18,7 +18,6 @@
 #include <iomanip>
 #include <cstdarg>
 #include <zlib.h>
-#include "usm_demux.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -40,7 +39,7 @@ namespace fs = std::filesystem;
 HWND g_hLog = NULL;
 std::mutex g_LogMutex;
 
-void GuiLog(const char* fmt, ...) {
+static void GuiLog(const char* fmt, ...) {
     if (!g_hLog) return;
     char buf[1024];
     va_list args;
@@ -116,7 +115,7 @@ static void run(const std::string& cmd) {
     std::string cmdMutable = cmd;
     if (CreateProcessA(NULL, &cmdMutable[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         CloseHandle(hWritePipe);
-        char buffer[256];
+        char buffer[256]{};
         DWORD bytesRead;
         while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
             buffer[bytesRead] = '\0';
@@ -148,10 +147,10 @@ static float read_f32le(const uint8_t* p) {
 
 struct FarcEntry {
     std::string name;
-    uint32_t offset;
-    uint32_t size;
-    uint32_t uncompressed;
-    bool compressed;
+    uint32_t offset = 0;
+    uint32_t size = 0;
+    uint32_t uncompressed = 0;
+    bool compressed = false;
 };
 
 struct FarcArchive {
@@ -264,14 +263,14 @@ struct FarcArchive {
 // ---- Sprite Set Binary (.bin) -----------------------------------------------
 struct SpriteInfo {
     std::string name;
-    uint32_t texture_index;
-    float x, y, w, h;
+    uint32_t texture_index = 0;
+    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
 };
 
 struct TextureInfo {
     std::string name;
-    int width, height;
-    int format;
+    int width = 0, height = 0;
+    int format = 0;
     std::vector<uint8_t> data;
     int chroma_width = 0, chroma_height = 0;
     std::vector<uint8_t> chroma_data;
@@ -392,7 +391,7 @@ static bool parse_bin(const std::vector<uint8_t>& bin, SpriteSetBin& out) {
 static void decode_bc1_block(const uint8_t* src, uint8_t* dst, int dst_stride) {
     uint16_t c0 = (uint16_t)(src[0] | (src[1] << 8));
     uint16_t c1 = (uint16_t)(src[2] | (src[3] << 8));
-    uint8_t r[4][3];
+    uint8_t r[4][3]{};
     auto unpack = [](uint16_t c, uint8_t* rgb) {
         rgb[0] = (uint8_t)((c >> 11 & 0x1F) * 255 / 31);
         rgb[1] = (uint8_t)((c >> 5 & 0x3F) * 255 / 63);
@@ -418,7 +417,7 @@ static void decode_bc1_block(const uint8_t* src, uint8_t* dst, int dst_stride) {
 
 static void decode_bc3_alpha_block(const uint8_t* src, uint8_t* alpha_out) {
     uint8_t a0 = src[0], a1 = src[1];
-    uint8_t av[8]; av[0] = a0; av[1] = a1;
+    uint8_t av[8]{}; av[0] = a0; av[1] = a1;
     if (a0 > a1) {
         for (int i = 2; i < 8; i++) av[i] = (uint8_t)(((8 - i) * a0 + (i - 1) * a1) / 7);
     }
@@ -632,7 +631,7 @@ static bool save_png(const std::string& path, const uint8_t* rgba, int w, int h)
     const uint8_t sig[] = { 0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A };
     out.insert(out.end(), sig, sig + 8);
 
-    uint8_t ihdr[13];
+    uint8_t ihdr[13]{};
     ihdr[0] = w >> 24; ihdr[1] = w >> 16; ihdr[2] = w >> 8; ihdr[3] = w;
     ihdr[4] = h >> 24; ihdr[5] = h >> 16; ihdr[6] = h >> 8; ihdr[7] = h;
     ihdr[8] = 8;
@@ -832,9 +831,28 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
     std::string song_folder_name;
     std::string display_name = !pv.song_name_en.empty() ? pv.song_name_en : pv.song_name;
     if (display_name.empty()) display_name = std::string("pv_") + pv_id_str;
-    for (char c : display_name) {
-        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') song_folder_name += '_';
-        else song_folder_name += c;
+    
+    // Replace fancy Unicode characters with ASCII equivalents or underscores
+    for (size_t j = 0; j < display_name.length(); ) {
+        unsigned char c = (unsigned char)display_name[j];
+        // Check for multi-byte UTF-8 characters (bytes >= 0x80)
+        if (c >= 0x80) {
+            // Skip this UTF-8 character and replace with underscore
+            song_folder_name += '_';
+            // Skip all continuation bytes of this UTF-8 character
+            j++;
+            while (j < display_name.length() && ((unsigned char)display_name[j] & 0xC0) == 0x80) {
+                j++;
+            }
+        }
+        else if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            song_folder_name += '_';
+            j++;
+        }
+        else {
+            song_folder_name += c;
+            j++;
+        }
     }
     song_folder_name = "pv_" + std::string(pv_id_str) + "_" + song_folder_name;
 
@@ -870,25 +888,13 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
         }
         if (!src_usm.empty() && fs::exists(src_usm)) {
             printf("  USM: %s\n", src_usm.filename().string().c_str());
-            std::string tmp_dir = (song_out / "_tmp_usm").string();
-            fs::create_directories(tmp_dir);
-            auto dr = usm::demux(src_usm.string(), tmp_dir);
-            if (!dr.error.empty())
-                fprintf(stderr, "  WARN: USM demux error: %s\n", dr.error.c_str());
+            fs::path out_usm = song_out / "song.usm";
+            std::error_code ec;
+            fs::copy_file(src_usm, out_usm, fs::copy_options::overwrite_existing, ec);
 
-            std::string m2v_path = dr.video_path;
-            if (!m2v_path.empty()) {
-                std::string out_mp4 = (song_out / "song.mp4").string();
-
-                std::string ffcmd = "ffmpeg -y -loglevel warning -stats -i \"" + m2v_path + "\" -c:v copy -an \"" + out_mp4 + "\"";
-
-                run(ffcmd);
+            if (ec) {
+                fprintf(stderr, "  WARN: Failed to copy USM: %s\n", ec.message().c_str());
             }
-
-            else {
-                fprintf(stderr, "  WARN: USM demux produced no m2v in %s\n", tmp_dir.c_str());
-            }
-            fs::remove_all(tmp_dir);
         }
         else {
             fprintf(stderr, "  WARN: USM not found (tried %s)\n", rel.c_str());
@@ -1097,7 +1103,7 @@ std::vector<LoadedSong> g_Songs;
 bool g_UpdatingList = false; // suppresses LVN_ITEMCHANGED sync during ApplyFilter
 std::atomic<bool> g_IsRunning = false;
 
-std::string BrowseFolder(HWND owner, const char* title) {
+static std::string BrowseFolder(HWND owner, const char* title) {
     IFileOpenDialog* pfd;
     if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd)))) {
         DWORD dwOptions;
@@ -1114,9 +1120,9 @@ std::string BrowseFolder(HWND owner, const char* title) {
             if (SUCCEEDED(pfd->GetResult(&psi))) {
                 PWSTR pszPath;
                 if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath))) {
-                    int size = WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)pszPath, -1, NULL, 0, NULL, NULL);
+                    int size = WideCharToMultiByte(CP_UTF8, 0, pszPath, -1, NULL, 0, NULL, NULL);
                     std::string result(size - 1, 0);
-                    WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)pszPath, -1, &result[0], size, NULL, NULL);
+                    WideCharToMultiByte(CP_UTF8, 0, pszPath, -1, &result[0], size, NULL, NULL);
                     CoTaskMemFree(pszPath);
                     psi->Release();
                     pfd->Release();
@@ -1130,7 +1136,7 @@ std::string BrowseFolder(HWND owner, const char* title) {
     return "";
 }
 
-std::string find_pv_db(const std::string& mod_root) {
+static std::string find_pv_db(const std::string& mod_root) {
     fs::path root(mod_root);
     for (const auto& rel : { "rom/mod_pv_db.txt", "mod_pv_db.txt", "rom/pv_db.txt" }) {
         fs::path p = root / rel;
@@ -1139,7 +1145,7 @@ std::string find_pv_db(const std::string& mod_root) {
     return "";
 }
 
-std::vector<std::string> collect_mod_roots(const std::string& path) {
+static std::vector<std::string> collect_mod_roots(const std::string& path) {
     if (!find_pv_db(path).empty()) return { path };
     std::vector<std::string> roots;
     try {
@@ -1153,33 +1159,50 @@ std::vector<std::string> collect_mod_roots(const std::string& path) {
     return roots;
 }
 
-void ApplyFilter() {
+static void ApplyFilter() {
     g_UpdatingList = true;
     ListView_DeleteAllItems(g_hList);
-    char query[256];
-    GetWindowTextA(g_hSearch, query, 256);
-    std::string sq = to_lower(query);
+    
+    // Get search query as wide string
+    wchar_t query_wide[256] = {};
+    GetWindowTextW(g_hSearch, query_wide, 256);
+    
+    // Convert wide query to UTF-8 for searching
+    std::string sq;
+    int queryLen = WideCharToMultiByte(CP_UTF8, 0, query_wide, -1, NULL, 0, NULL, NULL);
+    if (queryLen > 1) {
+        sq.resize(queryLen - 1);
+        WideCharToMultiByte(CP_UTF8, 0, query_wide, -1, &sq[0], queryLen, NULL, NULL);
+        sq = to_lower(sq);
+    }
 
     int row = 0;
     for (size_t i = 0; i < g_Songs.size(); i++) {
-        char label[512];
-        snprintf(label, sizeof(label), "[pv_%04d]  %s  (%s)",
+        // Build label in UTF-8 first
+        char label_utf8[512];
+        snprintf(label_utf8, sizeof(label_utf8), "[pv_%04d]  %s  (%s)",
             g_Songs[i].pv_id, g_Songs[i].name.c_str(), fs::path(g_Songs[i].mod_root).filename().string().c_str());
 
-        if (!sq.empty() && to_lower(label).find(sq) == std::string::npos) continue;
+        // Apply filter on UTF-8 string
+        if (!sq.empty() && to_lower(label_utf8).find(sq) == std::string::npos) continue;
 
-        LVITEMA lvi = { 0 };
+        // Convert UTF-8 label to wide characters for ListView display
+        int labelLen = MultiByteToWideChar(CP_UTF8, 0, label_utf8, -1, NULL, 0);
+        std::wstring label_wide(labelLen - 1, 0);
+        MultiByteToWideChar(CP_UTF8, 0, label_utf8, -1, &label_wide[0], labelLen);
+
+        LVITEMW lvi = { 0 };
         lvi.mask = LVIF_TEXT | LVIF_PARAM;
         lvi.iItem = row++;
-        lvi.pszText = label;
+        lvi.pszText = (wchar_t*)label_wide.c_str();
         lvi.lParam = (LPARAM)i;
-        ListView_InsertItem(g_hList, &lvi);
+        SendMessageW(g_hList, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
         ListView_SetCheckState(g_hList, lvi.iItem, g_Songs[i].selected);
     }
     g_UpdatingList = false;
 }
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         // Inside case WM_CREATE:
@@ -1374,8 +1397,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+int WINAPI WinMain(
+    _In_ HINSTANCE hInstance,
+    _In_opt_ HINSTANCE hPrevInstance,
+    _In_ LPSTR lpCmdLine,
+    _In_ int nCmdShow
+) {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) {
+        MessageBoxA(NULL, "Failed to initialize COM library.", "Error", MB_ICONERROR);
+        return -1;
+    }
+
     INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icex);
 
