@@ -1,6 +1,5 @@
 // mm_converter.cpp
 // Converts Project DIVA Mega Mix+ song mods to MicroMix+ format.
-// Deps: zlib (FARC decompression). FFmpeg must be in PATH.
 
 #include <cstdio>
 #include <cstdint>
@@ -141,6 +140,129 @@ static uint32_t read_u32be(const uint8_t* p) {
 static float read_f32le(const uint8_t* p) {
     uint32_t v = read_u32le(p);
     float f; memcpy(&f, &v, 4); return f;
+}
+
+// ---- DSC lyric cue extraction ------------------------------------------------
+// Reads TIME/LYRIC ops directly from a .dsc chart to recover the timing for
+// each lyric line index, so we can emit a proper timed .lrc.
+// DSC op stream (FT format, after the 4-byte signature): repeating
+// [op_id: i32le][params: i32le * param_cnt], op_id 0 = END.
+// TIME (op 1, 1 param): DivaTime, an i32 scaled by 100000 units/second.
+// LYRIC (op 24, 2 params): [lyric line index, color] (-1 color = default; index 0 = clear line)
+
+static const int kDscOpParamCount[107] = {
+    /*0*/0,/*1*/1,/*2*/4,/*3*/2,/*4*/2,/*5*/2,/*6*/7,/*7*/4,/*8*/2,/*9*/6,
+    /*10*/2,/*11*/1,/*12*/6,/*13*/2,/*14*/1,/*15*/1,/*16*/3,/*17*/2,/*18*/3,/*19*/5,
+    /*20*/5,/*21*/4,/*22*/4,/*23*/5,/*24*/2,/*25*/0,/*26*/2,/*27*/4,/*28*/2,/*29*/2,
+    /*30*/1,/*31*/21,/*32*/0,/*33*/3,/*34*/2,/*35*/5,/*36*/1,/*37*/1,/*38*/7,/*39*/1,
+    /*40*/1,/*41*/2,/*42*/1,/*43*/2,/*44*/1,/*45*/2,/*46*/3,/*47*/3,/*48*/1,/*49*/2,
+    /*50*/2,/*51*/3,/*52*/6,/*53*/6,/*54*/1,/*55*/1,/*56*/2,/*57*/3,/*58*/1,/*59*/2,
+    /*60*/2,/*61*/4,/*62*/4,/*63*/1,/*64*/2,/*65*/1,/*66*/2,/*67*/1,/*68*/1,/*69*/3,
+    /*70*/3,/*71*/3,/*72*/2,/*73*/1,/*74*/9,/*75*/3,/*76*/2,/*77*/4,/*78*/2,/*79*/3,
+    /*80*/2,/*81*/24,/*82*/1,/*83*/2,/*84*/1,/*85*/3,/*86*/1,/*87*/3,/*88*/4,/*89*/1,
+    /*90*/2,/*91*/6,/*92*/3,/*93*/2,/*94*/3,/*95*/3,/*96*/4,/*97*/1,/*98*/1,/*99*/3,
+    /*100*/3,/*101*/4,/*102*/1,/*103*/3,/*104*/3,/*105*/8,/*106*/2
+};
+
+struct LyricCue {
+    double time_seconds = 0.0;
+    int lyric_index = 0; // 0 = clear/blank line
+};
+
+// Returns the ordered list of TIME/LYRIC cues found in a .dsc file, or an
+// empty list if the file couldn't be read or parsed.
+static std::vector<LyricCue> extract_lyric_cues(const fs::path& dsc_path) {
+    std::vector<LyricCue> cues;
+
+    std::ifstream f(dsc_path, std::ios::binary | std::ios::ate);
+    if (!f) return cues;
+    size_t sz = (size_t)f.tellg();
+    f.seekg(0);
+    std::vector<uint8_t> data(sz);
+    f.read((char*)data.data(), sz);
+    if (sz < 4) return cues;
+
+    size_t pos = 4; // skip signature
+    int32_t currentTime = 0;
+
+    while (pos + 4 <= sz) {
+        int32_t op_id = (int32_t)read_u32le(data.data() + pos);
+        pos += 4;
+
+        if (op_id == 0) break; // END
+
+        if (op_id < 0 || op_id >= (int)(sizeof(kDscOpParamCount) / sizeof(kDscOpParamCount[0]))) {
+            fprintf(stderr, "  WARN: Unknown DSC op id %d, stopping lyric scan\n", op_id);
+            break;
+        }
+        int param_cnt = kDscOpParamCount[op_id];
+        if (pos + (size_t)param_cnt * 4 > sz) break;
+
+        if (op_id == 1) { // TIME
+            currentTime = (int32_t)read_u32le(data.data() + pos);
+        }
+        else if (op_id == 24) { // LYRIC
+            int32_t lyric_index = (int32_t)read_u32le(data.data() + pos);
+            cues.push_back({ currentTime / 100000.0, lyric_index });
+        }
+
+        pos += (size_t)param_cnt * 4;
+    }
+
+    return cues;
+}
+
+static std::string fmt_lrc_time(double t) {
+    int minutes = (int)(t / 60.0);
+    double seconds = t - minutes * 60.0;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "[%02d:%05.2f]", minutes, seconds);
+    return buf;
+}
+
+// The lyric row only fits ~90 characters before overflowing off-screen
+// (empirically confirmed in-game); wrap anything longer onto extra timed
+// lines, splitting the available display time proportionally by length.
+static const size_t kLyricLineMaxChars = 80;
+
+struct WrappedLyricPart {
+    std::string text;
+    double time_offset = 0.0; // seconds after the original cue's start time
+};
+
+// Splits `text` into chunks of at most maxChars, breaking on spaces so words
+// stay whole. `duration` is the total time the original line would have been
+// shown for; each chunk gets a share of that proportional to its length, so
+// longer chunks linger a bit longer instead of every chunk getting equal time.
+static std::vector<WrappedLyricPart> wrap_lyric_line(const std::string& text, size_t maxChars, double duration) {
+    std::vector<std::string> chunks;
+    size_t start = 0;
+    while (start < text.size()) {
+        if (text.size() - start <= maxChars) {
+            chunks.push_back(text.substr(start));
+            break;
+        }
+        size_t breakAt = text.rfind(' ', start + maxChars);
+        if (breakAt == std::string::npos || breakAt <= start) {
+            // No good break point (single very long word) — hard split.
+            breakAt = start + maxChars;
+        }
+        chunks.push_back(text.substr(start, breakAt - start));
+        start = (breakAt < text.size() && text[breakAt] == ' ') ? breakAt + 1 : breakAt;
+    }
+    if (chunks.empty()) chunks.push_back(text);
+
+    size_t totalChars = 0;
+    for (auto& c : chunks) totalChars += c.size();
+    if (totalChars == 0) totalChars = 1;
+
+    std::vector<WrappedLyricPart> out;
+    double offset = 0.0;
+    for (auto& c : chunks) {
+        out.push_back({ c, offset });
+        offset += duration * ((double)c.size() / (double)totalChars);
+    }
+    return out;
 }
 
 // ---- FARC Archive -----------------------------------------------------------
@@ -696,6 +818,24 @@ static bool save_sprite_png_trimmed(const std::string& path,
     return save_png(path, square.data(), side, side);
 }
 
+// Some mod logo sprites are effectively blank (author had no logo, left a
+// fully or near-fully transparent placeholder, sometimes with a few stray
+// faint pixels from a bad export). Treat anything below both a per-pixel
+// alpha threshold and a minimum-coverage threshold as blank, so we can skip
+// writing a logo file that would just be invisible in-game.
+static bool is_effectively_blank(const std::vector<uint8_t>& rgba, int w, int h) {
+    const uint8_t kAlphaThreshold = 32;      // ~12.5% opacity; below this, treat as noise
+    const double kMinCoverageFrac = 0.001;   // at least 0.1% of pixels must be meaningfully opaque
+
+    size_t meaningfulPixels = 0;
+    size_t totalPixels = (size_t)w * (size_t)h;
+    for (size_t i = 0; i < totalPixels; i++) {
+        if (rgba[i * 4 + 3] >= kAlphaThreshold)
+            meaningfulPixels++;
+    }
+    return totalPixels == 0 || ((double)meaningfulPixels / (double)totalPixels) < kMinCoverageFrac;
+}
+
 // ---- mod_pv_db.txt Parser ---------------------------------------------------
 
 struct PvDifficulty {
@@ -718,6 +858,8 @@ struct PvEntry {
     std::string movie_file_name;
     float sabi_start = 0, sabi_play = 30;
     PvDifficulty easy, normal, hard, extreme, exextreme;
+    std::map<int, std::string> lyric_lines;    // pv_<id>.lyric.NNN
+    std::map<int, std::string> lyric_en_lines; // pv_<id>.lyric_en.NNN
 };
 
 static std::string pv_level_to_float(const std::string& lvl) {
@@ -726,6 +868,20 @@ static std::string pv_level_to_float(const std::string& lvl) {
     std::string d = lvl.substr(9, 1);
     int whole = std::stoi(ww);
     return std::to_string(whole) + "." + d;
+}
+
+// Some pv_db lyric lines contain a literal "\n" (backslash + n) as a manual
+// line-break hack for the real game's lyric display. Our (and apparently
+// the real game's) lyric row only has room for one line, so this just
+// causes the text to overflow into other UI. Collapse it into a single
+// line instead of splitting it.
+static std::string sanitize_lyric_line(std::string val) {
+    size_t pos = 0;
+    while ((pos = val.find("\\n", pos)) != std::string::npos) {
+        val.replace(pos, 2, " ");
+        pos += 1;
+    }
+    return val;
 }
 
 static std::map<int, PvEntry> parse_pv_db(const std::string& path) {
@@ -769,6 +925,14 @@ static std::map<int, PvEntry> parse_pv_db(const std::string& path) {
         else if (rest == "songinfo.lyrics")      e.lyrics = val;
         else if (rest == "songinfo.music")       e.music = val;
         else if (rest == "songinfo.arranger")    e.arranger = val;
+        else if (rest.rfind("lyric.", 0) == 0) {
+            try { e.lyric_lines[std::stoi(rest.substr(6))] = sanitize_lyric_line(val); }
+            catch (...) {}
+        }
+        else if (rest.rfind("lyric_en.", 0) == 0) {
+            try { e.lyric_en_lines[std::stoi(rest.substr(9))] = sanitize_lyric_line(val); }
+            catch (...) {}
+        }
         else if (rest.rfind("difficulty.", 0) == 0) {
             std::string d_rest = rest.substr(11);
             auto get_diff = [&](const std::string& t) -> PvDifficulty* {
@@ -831,7 +995,7 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
     std::string song_folder_name;
     std::string display_name = !pv.song_name_en.empty() ? pv.song_name_en : pv.song_name;
     if (display_name.empty()) display_name = std::string("pv_") + pv_id_str;
-    
+
     // Replace fancy Unicode characters with ASCII equivalents or underscores
     for (size_t j = 0; j < display_name.length(); ) {
         unsigned char c = (unsigned char)display_name[j];
@@ -856,7 +1020,32 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
     }
     song_folder_name = "pv_" + std::string(pv_id_str) + "_" + song_folder_name;
 
-    fs::path song_out = out_root / song_folder_name;
+    // Sanitize the mod pack's own folder name the same way, so songs land
+    // in data/song/<modpack name>/<song>/ instead of flattening everything
+    // into one folder when converting multiple packs at once.
+    std::string modpack_raw_name = mod_root.filename().string();
+    std::string modpack_folder_name;
+    for (size_t j = 0; j < modpack_raw_name.length(); ) {
+        unsigned char c = (unsigned char)modpack_raw_name[j];
+        if (c >= 0x80) {
+            modpack_folder_name += '_';
+            j++;
+            while (j < modpack_raw_name.length() && ((unsigned char)modpack_raw_name[j] & 0xC0) == 0x80) {
+                j++;
+            }
+        }
+        else if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            modpack_folder_name += '_';
+            j++;
+        }
+        else {
+            modpack_folder_name += c;
+            j++;
+        }
+    }
+    if (modpack_folder_name.empty()) modpack_folder_name = "mod";
+
+    fs::path song_out = out_root / modpack_folder_name / song_folder_name;
     fs::create_directories(song_out);
 
     printf("\n[pv_%s] %s -> %s\n", pv_id_str, display_name.c_str(), song_out.string().c_str());
@@ -901,24 +1090,85 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
         }
     }
 
-    auto copy_dsc = [&](const PvDifficulty& diff, const std::string& dest_name) {
-        if (!diff.present || diff.script_file.empty()) return;
+    auto copy_dsc = [&](const PvDifficulty& diff, const std::string& dest_name) -> bool {
+        if (!diff.present || diff.script_file.empty()) return false;
         std::string rel = diff.script_file;
         if (rel.rfind("rom/", 0) == 0) rel = rel.substr(4);
         fs::path src = rom / rel;
         if (fs::exists(src)) {
             fs::copy_file(src, song_out / dest_name, fs::copy_options::overwrite_existing);
             printf("  DSC: %s -> %s\n", src.filename().string().c_str(), dest_name.c_str());
+            return true;
         }
         else {
-            fprintf(stderr, "  WARN: DSC not found: %s\n", src.string().c_str());
+            fprintf(stderr, "  WARN: DSC not found, skipping difficulty: %s\n", src.string().c_str());
+            return false;
         }
         };
-    copy_dsc(pv.easy, "song_easy.dsc");
-    copy_dsc(pv.normal, "song_normal.dsc");
-    copy_dsc(pv.hard, "song_hard.dsc");
-    copy_dsc(pv.extreme, "song_extreme.dsc");
-    copy_dsc(pv.exextreme, "song_exextreme.dsc");
+    bool easy_ok = copy_dsc(pv.easy, "song_easy.dsc");
+    bool normal_ok = copy_dsc(pv.normal, "song_normal.dsc");
+    bool hard_ok = copy_dsc(pv.hard, "song_hard.dsc");
+    bool extreme_ok = copy_dsc(pv.extreme, "song_extreme.dsc");
+    bool exextreme_ok = copy_dsc(pv.exextreme, "song_exextreme.dsc");
+
+    // Lyrics: prefer lyric_en (game is English) per line, falling back to the
+    // native lyric line if lyric_en is missing or blank (pv_db often has both
+    // keys present but empty, e.g. "pv_2500.lyric_en.001=", rather than
+    // omitting the key entirely). Timing comes from the TIME/LYRIC cues
+    // embedded in a copied .dsc chart; any difficulty's chart carries the
+    // same lyric cues, so use whichever was copied successfully, preferring
+    // the higher difficulties first.
+    bool has_lyrics = false;
+    if (!pv.lyric_lines.empty() || !pv.lyric_en_lines.empty()) {
+        fs::path lyric_dsc;
+        if (exextreme_ok)   lyric_dsc = song_out / "song_exextreme.dsc";
+        else if (extreme_ok) lyric_dsc = song_out / "song_extreme.dsc";
+        else if (hard_ok)    lyric_dsc = song_out / "song_hard.dsc";
+        else if (normal_ok)  lyric_dsc = song_out / "song_normal.dsc";
+        else if (easy_ok)    lyric_dsc = song_out / "song_easy.dsc";
+
+        if (!lyric_dsc.empty()) {
+            auto cues = extract_lyric_cues(lyric_dsc);
+
+            auto line_text = [&](int idx) -> const std::string* {
+                auto en = pv.lyric_en_lines.find(idx);
+                if (en != pv.lyric_en_lines.end() && !en->second.empty()) return &en->second;
+                auto native = pv.lyric_lines.find(idx);
+                if (native != pv.lyric_lines.end() && !native->second.empty()) return &native->second;
+                return nullptr;
+                };
+
+            std::ostringstream lrc;
+            size_t line_count = 0;
+            for (size_t i = 0; i < cues.size(); i++) {
+                const auto& cue = cues[i];
+                if (cue.lyric_index == 0) continue; // clear/blank line, nothing to show
+                const std::string* text = line_text(cue.lyric_index);
+                if (!text) continue;
+
+                // Next cue (even a clear-line one) bounds how long this line is shown,
+                // giving us a time budget to split across when the line has to wrap.
+                double end_time = (i + 1 < cues.size()) ? cues[i + 1].time_seconds : cue.time_seconds + 3.0;
+                double duration = std::max(0.1, end_time - cue.time_seconds);
+
+                for (auto& part : wrap_lyric_line(*text, kLyricLineMaxChars, duration)) {
+                    lrc << fmt_lrc_time(cue.time_seconds + part.time_offset) << part.text << "\n";
+                    line_count++;
+                }
+            }
+
+            std::string lrc_str = lrc.str();
+            if (!lrc_str.empty()) {
+                std::ofstream lrc_f(song_out / "lyrics.lrc", std::ios::binary);
+                lrc_f << lrc_str;
+                printf("  LRC: lyrics.lrc written (%zu lines)\n", line_count);
+                has_lyrics = true;
+            }
+        }
+        else {
+            fprintf(stderr, "  WARN: lyric text present but no DSC available for timing, skipping lyrics.lrc\n");
+        }
+    }
 
     char pv_id_padded[8];
     snprintf(pv_id_padded, sizeof(pv_id_padded), "%d", pv.id);
@@ -969,7 +1219,7 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
                                 if (save_sprite_png(out_img.string(), decoded_textures[ti], tw, th, (int)spi.x, (int)spi.y, (int)spi.w, (int)spi.h)) {
                                     bg_png_name = "bg.png";
                                     skipped_bg_due_to_image = true;
-                                    printf("  IMG: bg.png (High-res override from 'IMAGE' sprite, %dx%d from tex%d)\n", (int)spi.w, (int)spi.h, ti);
+                                    printf("  IMG: bg.png (Possible High-res override from other sprite, %dx%d from tex%d)\n", (int)spi.w, (int)spi.h, ti);
                                     break;
                                 }
                             }
@@ -979,6 +1229,21 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
                             uint32_t ti = spi.texture_index;
                             if (ti >= decoded_textures.size() || decoded_textures[ti].empty()) return false;
                             int tw = spr.textures[ti].width, th = spr.textures[ti].height;
+
+                            if (target_file == "logo.png") {
+                                int sx = std::max(0, std::min((int)spi.x, tw - 1));
+                                int sy = std::max(0, std::min((int)spi.y, th - 1));
+                                int sw = std::max(1, std::min((int)spi.w, tw - sx));
+                                int sh = std::max(1, std::min((int)spi.h, th - sy));
+                                std::vector<uint8_t> crop(sw * sh * 4);
+                                for (int y = 0; y < sh; y++)
+                                    memcpy(crop.data() + y * sw * 4, decoded_textures[ti].data() + (sy + y) * tw * 4 + sx * 4, sw * 4);
+                                if (is_effectively_blank(crop, sw, sh)) {
+                                    printf("  IMG: logo.png skipped (sprite is effectively blank/transparent)\n");
+                                    return false;
+                                }
+                            }
+
                             fs::path out_img = song_out / target_file;
                             bool ok = trim_image
                                 ? save_sprite_png_trimmed(out_img.string(), decoded_textures[ti], tw, th, (int)spi.x, (int)spi.y, (int)spi.w, (int)spi.h)
@@ -1033,33 +1298,35 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
 
     std::string display_en = !pv.song_name_en.empty() ? pv.song_name_en : pv.song_name;
 
-    auto diff_level = [](const PvDifficulty& d) -> std::string {
-        if (!d.present || d.level.empty()) return "";
+    auto diff_level = [](const PvDifficulty& d, bool ok) -> std::string {
+        if (!ok || d.level.empty()) return "";
         return pv_level_to_float(d.level);
         };
     std::ostringstream ini;
-    ini << "difficulty.easy.level=" << diff_level(pv.easy) << "\n";
-    ini << "difficulty.easy.script_file_name=" << (pv.easy.present ? "song_easy.dsc" : "") << "\n";
+    ini << "difficulty.easy.level=" << diff_level(pv.easy, easy_ok) << "\n";
+    ini << "difficulty.easy.script_file_name=" << (easy_ok ? "song_easy.dsc" : "") << "\n";
     ini << "\n";
-    ini << "difficulty.normal.level=" << diff_level(pv.normal) << "\n";
-    ini << "difficulty.normal.script_file_name=" << (pv.normal.present ? "song_normal.dsc" : "") << "\n";
+    ini << "difficulty.normal.level=" << diff_level(pv.normal, normal_ok) << "\n";
+    ini << "difficulty.normal.script_file_name=" << (normal_ok ? "song_normal.dsc" : "") << "\n";
     ini << "\n";
-    ini << "difficulty.hard.level=" << diff_level(pv.hard) << "\n";
-    ini << "difficulty.hard.script_file_name=" << (pv.hard.present ? "song_hard.dsc" : "") << "\n";
+    ini << "difficulty.hard.level=" << diff_level(pv.hard, hard_ok) << "\n";
+    ini << "difficulty.hard.script_file_name=" << (hard_ok ? "song_hard.dsc" : "") << "\n";
     ini << "\n";
-    ini << "difficulty.extreme.level=" << diff_level(pv.extreme) << "\n";
-    ini << "difficulty.extreme.script_file_name=" << (pv.extreme.present ? "song_extreme.dsc" : "") << "\n";
+    ini << "difficulty.extreme.level=" << diff_level(pv.extreme, extreme_ok) << "\n";
+    ini << "difficulty.extreme.script_file_name=" << (extreme_ok ? "song_extreme.dsc" : "") << "\n";
     ini << "\n";
-    ini << "difficulty.exextreme.level=" << diff_level(pv.exextreme) << "\n";
-    ini << "difficulty.exextreme.script_file_name=" << (pv.exextreme.present ? "song_exextreme.dsc" : "") << "\n";
+    ini << "difficulty.exextreme.level=" << diff_level(pv.exextreme, exextreme_ok) << "\n";
+    ini << "difficulty.exextreme.script_file_name=" << (exextreme_ok ? "song_exextreme.dsc" : "") << "\n";
     ini << "\n";
 
     bool has_mp4 = fs::exists(song_out / "song.mp4");
-    ini << "movie_file_name=" << (has_mp4 ? "song.mp4" : "") << "\n";
+    bool has_usm = fs::exists(song_out / "song.usm");
+    ini << "movie_file_name=" << (has_mp4 ? "song.mp4" : has_usm ? "song.usm" : "") << "\n";
     ini << "song_file_name=" << (fs::exists(song_out / "song.ogg") ? "song.ogg" : "") << "\n";
     ini << "background_file_name=" << bg_png_name << "\n";
     ini << "jacket_file_name=" << jk_png_name << "\n";
     ini << "logo_file_name=" << logo_png_name << "\n";
+    ini << "lyrics_file=" << (has_lyrics ? "lyrics.lrc" : "") << "\n";
     ini << "\n";
     ini << "songinfo.name=" << display_en << "\n";
     if (!pv.arranger.empty()) ini << "songinfo.arranger=" << pv.arranger << "\n";
@@ -1079,7 +1346,7 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
 
 // ---- Native Win32 GUI Implementation ----------------------------------------
 
-HWND g_hMain, g_hEditMod, g_hEditOut, g_hSearch, g_hList, g_hRunBtn;
+HWND g_hMain, g_hEditMod, g_hEditOut, g_hSearch, g_hList, g_hRunBtn, g_hCancelBtn;
 HWND g_hChkSkipVideo;
 
 // Try every drive letter for "X:\SteamLibrary\steamapps\common\Hatsune Miku Project DIVA Mega Mix Plus\mods"
@@ -1102,6 +1369,7 @@ struct LoadedSong {
 std::vector<LoadedSong> g_Songs;
 bool g_UpdatingList = false; // suppresses LVN_ITEMCHANGED sync during ApplyFilter
 std::atomic<bool> g_IsRunning = false;
+std::atomic<bool> g_CancelRequested = false;
 
 static std::string BrowseFolder(HWND owner, const char* title) {
     IFileOpenDialog* pfd;
@@ -1162,11 +1430,11 @@ static std::vector<std::string> collect_mod_roots(const std::string& path) {
 static void ApplyFilter() {
     g_UpdatingList = true;
     ListView_DeleteAllItems(g_hList);
-    
+
     // Get search query as wide string
     wchar_t query_wide[256] = {};
     GetWindowTextW(g_hSearch, query_wide, 256);
-    
+
     // Convert wide query to UTF-8 for searching
     std::string sq;
     int queryLen = WideCharToMultiByte(CP_UTF8, 0, query_wide, -1, NULL, 0, NULL, NULL);
@@ -1263,8 +1531,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         LVCOLUMNA col = { LVCF_WIDTH, 0, 550 };
         ListView_InsertColumn(g_hList, 0, &col);
         g_hRunBtn = createCtrl("BUTTON", "Convert Selected", 0, 10, 340, 150, 30, 10);
+        g_hCancelBtn = createCtrl("BUTTON", "Cancel", 0, 170, 340, 100, 30, 11);
+        EnableWindow(g_hCancelBtn, FALSE);
 
         g_hLog = createCtrl("EDIT", "", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 10, 380, 580, 130, 100);
+        SendMessageA(g_hLog, EM_SETLIMITTEXT, (WPARAM)0x7FFFFFFE, 0); // default 32KB limit silently drops text once full
         return 0;
     }
 
@@ -1336,7 +1607,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
 
             g_IsRunning = true;
+            g_CancelRequested = false;
             EnableWindow(g_hRunBtn, FALSE);
+            EnableWindow(g_hCancelBtn, TRUE);
             std::string outStr = outPath;
 
             std::thread([jobs, outStr, skipVideo]() {
@@ -1345,6 +1618,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
                 int done = 0;
                 for (const auto& job : jobs) {
+                    if (g_CancelRequested) {
+                        GuiLog("\r\nCancelled.\r\n");
+                        break;
+                    }
                     GuiLog("\r\n--- Processing [pv_%04d] %s ---\r\n", job.pv_id, job.name.c_str());
                     auto pvs = parse_pv_db(find_pv_db(job.mod_root));
                     if (pvs.count(job.pv_id)) {
@@ -1353,10 +1630,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     done++;
                     GuiLog("Progress: %d / %zu songs processed.\r\n", done, jobs.size());
                 }
-                GuiLog("\r\nAll selected tasks finished.\r\n");
+                if (!g_CancelRequested)
+                    GuiLog("\r\nAll selected tasks finished.\r\n");
                 g_IsRunning = false;
+                g_CancelRequested = false;
                 EnableWindow(g_hRunBtn, TRUE);
+                EnableWindow(g_hCancelBtn, FALSE);
                 }).detach();
+            break;
+        }
+        case 11: {
+            if (!g_IsRunning) break;
+            g_CancelRequested = true;
+            EnableWindow(g_hCancelBtn, FALSE);
             break;
         }
         }
@@ -1373,6 +1659,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         MoveWindow(g_hList, 10, 110, w - 20, h - 260, TRUE);
         ListView_SetColumnWidth(g_hList, 0, w - 40);
         MoveWindow(g_hRunBtn, 10, h - 145, 150, 30, TRUE);
+        MoveWindow(g_hCancelBtn, 170, h - 145, 100, 30, TRUE);
         MoveWindow(g_hLog, 10, h - 105, w - 20, 95, TRUE);
         break;
     }
