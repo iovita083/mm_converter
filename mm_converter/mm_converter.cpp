@@ -1352,11 +1352,15 @@ HWND g_hChkSkipVideo;
 // Try every drive letter for "X:\SteamLibrary\steamapps\common\Hatsune Miku Project DIVA Mega Mix Plus\mods"
 static std::string AutoDetectModsFolder() {
     const char* rel = "SteamLibrary\\steamapps\\common\\Hatsune Miku Project DIVA Mega Mix Plus\\mods";
+    UINT oldMode = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    std::string found;
     for (char d = 'A'; d <= 'Z'; d++) {
         std::string path = std::string(1, d) + ":\\" + rel;
-        if (fs::is_directory(path)) return path;
+        std::error_code ec;
+        if (fs::is_directory(path, ec)) { found = path; break; }
     }
-    return "";
+    SetErrorMode(oldMode);
+    return found;
 }
 
 struct LoadedSong {
@@ -1708,7 +1712,7 @@ int WINAPI WinMain(
     wc.lpszClassName = clsName;
     RegisterClassExA(&wc);
 
-    g_hMain = CreateWindowExA(0, clsName, "mm_converter GUI", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    g_hMain = CreateWindowExA(0, clsName, "mm_converter", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 720, 560, NULL, NULL, hInstance, NULL);
 
     {
