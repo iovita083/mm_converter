@@ -854,6 +854,7 @@ struct PvEntry {
     std::string lyrics;
     std::string music;
     std::string arranger;
+    std::string illustrator;
     std::string song_file_name;
     std::string movie_file_name;
     float sabi_start = 0, sabi_play = 30;
@@ -925,6 +926,7 @@ static std::map<int, PvEntry> parse_pv_db(const std::string& path) {
         else if (rest == "songinfo.lyrics")      e.lyrics = val;
         else if (rest == "songinfo.music")       e.music = val;
         else if (rest == "songinfo.arranger")    e.arranger = val;
+        else if (rest == "songinfo.illustrator") e.illustrator = val;
         else if (rest.rfind("lyric.", 0) == 0) {
             try { e.lyric_lines[std::stoi(rest.substr(6))] = sanitize_lyric_line(val); }
             catch (...) {}
@@ -1330,6 +1332,7 @@ static void convert_song(const fs::path& mod_root, const PvEntry& pv,
     ini << "\n";
     ini << "songinfo.name=" << display_en << "\n";
     if (!pv.arranger.empty()) ini << "songinfo.arranger=" << pv.arranger << "\n";
+    if (!pv.illustrator.empty()) ini << "songinfo.illustrator=" << pv.illustrator << "\n";
     if (!pv.lyrics.empty())   ini << "songinfo.lyrics=" << pv.lyrics << "\n";
     if (!pv.music.empty())    ini << "songinfo.music=" << pv.music << "\n";
     ini << "songinfo.bpm=" << pv.bpm << "\n";
