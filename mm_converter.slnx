@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="Release" />
+    <Platform Name="x64" />
+    <Config Name="Release" />
+  </Configurations>
+  <Project Path="mm_converter\mm_converter.vcxproj" Id="c052de49-c670-483c-9d7a-c501c73e0af4" />
+</Solution>
